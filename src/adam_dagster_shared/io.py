@@ -3,11 +3,19 @@ import pathlib
 import pickle
 import traceback
 from collections.abc import Generator
-from typing import Any, Dict, Tuple, Union
+from typing import Any, Dict, Generic, Tuple, TypeVar, Union
 
 import dagster
-from dagster import (DagsterEventType, Field, InputContext, MetadataValue,
-                     OutputContext, StringSource, UPathIOManager, io_manager)
+from dagster import (
+    DagsterEventType,
+    Field,
+    InputContext,
+    MetadataValue,
+    OutputContext,
+    StringSource,
+    UPathIOManager,
+    io_manager,
+)
 from dagster._utils import PICKLE_PROTOCOL
 from upath import UPath
 
