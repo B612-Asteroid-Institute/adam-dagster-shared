@@ -45,7 +45,8 @@ def get_current_namespace() -> str:
 def create_k8s_config(
     cpu: int = 1000,
     memory: int = 2000,
-    tmp_volume: Optional[int] = None,
+    tmp_volume: int = 0,
+    shm_volume: int = 0,
     allow_spot: Optional[bool] = False,
     allow_private: Optional[bool] = False,
     use_spot: Optional[bool] = False,
@@ -118,11 +119,7 @@ def create_k8s_config(
         "pod_spec_config": {},
     }
 
-    if tmp_volume:
-        # Add a buffer of 2Gi to the ephemeral storage request
-        spec["container_config"]["resources"]["requests"][
-            "ephemeral-storage"
-        ] = f"{tmp_volume + 2}Gi"
+    if tmp_volume > 0:
         spec["container_config"]["volume_mounts"] = [
             {
                 "name": "run-volume",
@@ -132,6 +129,23 @@ def create_k8s_config(
         spec["pod_spec_config"]["volumes"] = [
             {"name": "run-volume", "empty_dir": {"size_limit": f"{tmp_volume}Gi"}}
         ]
+
+    if shm_volume > 0:
+        spec["container_config"]["volume_mounts"] = [
+            {"name": "shm-volume", "mountPath": "/dev/shm", "read_only": False}
+        ]
+        spec["pod_spec_config"]["volumes"] = [
+            {"name": "shm-volume", "empty_dir": {"size_limit": f"{shm_volume}Gi"}}
+        ]
+
+    # Create the ephemeral storage request with a buffer of 2Gi
+    # from the combination of tmp_volume and shm_volume
+    total_volume = tmp_volume + shm_volume
+    if total_volume > 0:
+        spec["container_config"]["resources"]["requests"][
+            "ephemeral-storage"
+        ] = f"{total_volume + 2}Gi"
+
 
     if allow_spot:
         spec["pod_spec_config"].setdefault("tolerations", []).append(
