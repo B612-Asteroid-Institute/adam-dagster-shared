@@ -1,0 +1,19 @@
+[project]
+name = "adam-dagster-shared"
+version = "0.1.0"
+description = "Shared utilities for Dagster user repositories"
+authors = [
+    {name = "Alec Koumjian", email = "alec@b612foundation.org"},
+]
+dependencies = ["google-cloud-container>=2.55.0", "kubernetes>=31.0.0", "google-auth>=2.37.0", "dagster>=1.8.7"]
+requires-python = "<3.13,>=3.11"
+readme = "README.md"
+license = {text = "MIT"}
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+
+[tool.pdm]
+distribution = true
