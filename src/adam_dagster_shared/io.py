@@ -5,6 +5,7 @@ import traceback
 from collections.abc import Generator
 from typing import Any, Dict, Tuple, Union
 
+import dagster
 from dagster import (DagsterEventType, Field, InputContext, MetadataValue,
                      OutputContext, StringSource, UPathIOManager, io_manager)
 from dagster._utils import PICKLE_PROTOCOL
@@ -280,3 +281,77 @@ def list_contents_io_manager(init_context):
     remote_base_path = UPath(remote_base_path_str)
 
     return ListContentsIOManager(remote_base_path=remote_base_path)
+
+
+T = TypeVar("T")
+
+
+class MetaValueDynamicOut(dagster.DynamicOutput[Generic[T]]):
+    """
+    Makes the mapping key the data that is passed to downstream job inputs.
+    """
+
+    def __init__(
+        self,
+        value: T,
+        *args,
+        **kwargs,
+    ):
+        metadata = kwargs.get("metadata", {})
+        metadata["value"] = value
+        return super().__init__(
+            value,
+            *args,
+            metadata=metadata,
+            **kwargs,
+        )
+
+
+class MetaDataIOManager(dagster.IOManager):
+    """
+    Passes results directly into Output metadata in the dagster db and loads it from there.
+
+    This was created in order to avoid the network I/O of storing small values to GCS.
+    It also avoids scanning the database events table for the value, which would be very
+    repetitive for each input load.
+
+    Must be used with MetaValueDynamicOut and it limited to values that can be
+    serialized as dagster metadata values.
+    """
+
+    def handle_output(self, context: dagster.OutputContext, obj: Any) -> None:
+        """
+        Object is storedin metadata by MetaValueDynamicOut
+        """
+        pass
+
+    def load_input(self, context: dagster.InputContext) -> Any:
+        """
+        Loads object from the output event metadata
+        """
+        # If the input came from an asset, grab the
+        # asset materialization record
+        if context.has_asset_key:
+            raise Exception("DBIOManager does not currently support assets.")
+
+        events = context.instance.all_logs(
+            run_id=context.upstream_output.run_id,
+            of_type=dagster.DagsterEventType.STEP_OUTPUT,
+        )
+        context.log.debug(f"Found {len(events)} events for {context.upstream_output.run_id}")
+
+        output_event = None
+        for event in events:
+            if (
+                event.dagster_event.event_specific_data.step_output_handle.step_key
+                == context.upstream_output.step_key
+                and event.dagster_event.event_specific_data.step_output_handle.output_name
+                == context.upstream_output.name
+                and event.dagster_event.event_specific_data.mapping_key == context.upstream_output.mapping_key
+            ):
+                output_event = event
+                break
+
+        value = output_event.dagster_event.event_specific_data.metadata["value"].value
+
+        return value
