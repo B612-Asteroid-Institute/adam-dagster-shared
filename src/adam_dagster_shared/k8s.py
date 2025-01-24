@@ -41,12 +41,11 @@ def get_current_namespace() -> str:
     return namespace
 
 
-
 def create_k8s_config(
-    cpu: int = 1000, # m
-    memory: int = 2000, # MiB
-    tmp_volume: int = 0, # MiB
-    shm_volume: int = 0, # MiB
+    cpu: int = 1000,  # m
+    memory: int = 2000,  # MiB
+    tmp_volume: int = 0,  # MiB
+    shm_volume: int = 0,  # MiB
     allow_spot: Optional[bool] = False,
     allow_private: Optional[bool] = False,
     use_spot: Optional[bool] = False,
@@ -141,7 +140,10 @@ def create_k8s_config(
             {"name": "shm-volume", "mountPath": "/dev/shm", "read_only": False}
         ]
         spec["pod_spec_config"]["volumes"] = [
-            {"name": "shm-volume", "empty_dir": {"medium": "Memory","size_limit": f"{shm_volume}Mi"}}
+            {
+                "name": "shm-volume",
+                "empty_dir": {"medium": "Memory", "size_limit": f"{shm_volume}Mi"},
+            }
         ]
 
     if allow_spot:

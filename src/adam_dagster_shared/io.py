@@ -346,7 +346,9 @@ class MetaDataIOManager(dagster.IOManager):
             run_id=context.upstream_output.run_id,
             of_type=dagster.DagsterEventType.STEP_OUTPUT,
         )
-        context.log.debug(f"Found {len(events)} events for {context.upstream_output.run_id}")
+        context.log.debug(
+            f"Found {len(events)} events for {context.upstream_output.run_id}"
+        )
 
         output_event = None
         for event in events:
@@ -355,7 +357,8 @@ class MetaDataIOManager(dagster.IOManager):
                 == context.upstream_output.step_key
                 and event.dagster_event.event_specific_data.step_output_handle.output_name
                 == context.upstream_output.name
-                and event.dagster_event.event_specific_data.mapping_key == context.upstream_output.mapping_key
+                and event.dagster_event.event_specific_data.mapping_key
+                == context.upstream_output.mapping_key
             ):
                 output_event = event
                 break

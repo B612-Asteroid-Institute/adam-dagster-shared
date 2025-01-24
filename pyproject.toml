@@ -10,6 +10,13 @@ requires-python = "<3.13,>=3.11"
 readme = "README.md"
 license = {text = "MIT"}
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8.3.4",
+    "ruff>=0.9.3",
+    "black>=24.10.0",
+    "isort>=5.13.2",
+]
 [build-system]
 requires = ["pdm-backend"]
 build-backend = "pdm.backend"
@@ -17,3 +24,32 @@ build-backend = "pdm.backend"
 
 [tool.pdm]
 distribution = true
+
+[tool.black]
+line-length = 88
+
+[tool.isort]
+profile = "black"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+lint.ignore = []
+exclude = ["build"]
+
+[tool.pdm.version]
+source = "scm"
+write_to = "adam_dagster_shared/_version.py"
+write_template = "__version__ = '{}'"
+
+[tool.pdm.scripts]
+check = { composite = ["lint", "typecheck", "test"] }
+format = { composite = ["black src/adam_dagster_shared", "isort src/adam_dagster_shared"] }
+lint = { composite = [
+  "ruff check src/adam_dagster_shared",
+  "black --check src/adam_dagster_shared",
+  "isort --check-only src/adam_dagster_shared",
+] }
+fix = "ruff check --fix src/adam_dagster_shared"
+typecheck = "mypy --strict src/adam_dagster_shared"
+test = "pytest {args}"
