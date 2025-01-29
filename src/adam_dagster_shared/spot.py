@@ -15,6 +15,8 @@ def retry_on_preemption(func):
         try:
             return func(*args, **kwargs)
         except SystemExit as e:
+            print(f"SystemExit: {e}")
+
             # Only error code 15 represents a preemption.
             # Error code 1 typically represents an OOM error that we don't
             # want to retry.
@@ -33,6 +35,12 @@ def retry_on_preemption(func):
                 "http://metadata.google.internal/computeMetadata/v1/instance/preempted",
                 headers={"Metadata-Flavor": "Google"},
             )
+            # print preempted status and error
+            print(f"Preempted: {preempted.text}")
+            # print response object
+            print(f"Response: {preempted}")
+            print(preempted)
+
             if preempted.text == "TRUE":
                 # Wait between 5 minutes to 10 minutes before retrying
                 # If we restart immediately we risk getting preempted again.
