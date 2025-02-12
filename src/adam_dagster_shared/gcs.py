@@ -53,9 +53,17 @@ def gcs_rsync(
     dst: str,
     delete_unmatched: Optional[bool] = False,
     exclude: Optional[str] = None,
+    make_public: Optional[bool] = False,
 ) -> subprocess.CompletedProcess | None:
     """
     Syncs a GCS path to another location, using `cp` for files and `rsync` for directories.
+
+    Args:
+        src: Source path
+        dst: Destination path
+        delete_unmatched: If True, deletes files in dst that don't exist in src
+        exclude: Pattern to exclude from sync
+        make_public: If True, makes the destination files publicly accessible
     """
     file_type = gcs_file_type(src)
     if not dst.startswith("gs://"):
@@ -79,6 +87,10 @@ def gcs_rsync(
 
     if delete_unmatched:
         command += ["-d"]
+
+    # Add public-read ACL during transfer if requested and destination is GCS
+    if make_public and dst.startswith("gs://"):
+        command += ["-a", "public-read"]
 
     command += [src, dst]
 
