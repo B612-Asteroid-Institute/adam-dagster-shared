@@ -78,6 +78,8 @@ def gcs_rsync(
         logger.warning(f"Source path {src} does not exist")
         return
 
+    logger.info(f"Syncing {src} to {dst}")
+
     if file_type == "file":
         command = ["gsutil", "-m", "cp"]
     else:
