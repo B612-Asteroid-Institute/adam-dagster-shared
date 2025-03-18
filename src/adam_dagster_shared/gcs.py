@@ -97,7 +97,9 @@ def gcs_rsync(
     command += [src, dst]
 
     try:
-        output = subprocess.run(command, check=True, capture_output=True, text=True)
+        output = subprocess.run(
+            command, check=True, capture_output=True, text=True, start_new_session=True
+        )
         logger.info(f"Command stdout: {output.stdout}")
         logger.info(f"Command stderr: {output.stderr}")
     except subprocess.CalledProcessError as e:
@@ -117,6 +119,7 @@ def gcs_rm(path: str) -> subprocess.CompletedProcess:
             check=True,
             capture_output=True,
             text=True,
+            start_new_session=True,
         )
     except subprocess.CalledProcessError as e:
         logger.info(e.stdout)
@@ -130,7 +133,13 @@ def gcs_exists(path: str) -> bool:
     Checks if a gcs path exists
     """
     try:
-        subprocess.run(["gsutil", "ls", path], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["gsutil", "ls", path],
+            check=True,
+            capture_output=True,
+            text=True,
+            start_new_session=True,
+        )
         return True
     except subprocess.CalledProcessError:
         return False

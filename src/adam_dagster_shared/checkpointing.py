@@ -1,5 +1,4 @@
 import logging
-import signal
 import threading
 import time
 from pathlib import Path
@@ -16,14 +15,6 @@ class DirectorySyncer:
         self.interval = interval
         self._stop_event = threading.Event()
         self._thread = None
-        # Register signal handlers
-        signal.signal(signal.SIGTERM, self._handle_signal)
-        signal.signal(signal.SIGINT, self._handle_signal)
-
-    def _handle_signal(self, signum, frame):
-        """Handle termination signals by stopping the sync thread"""
-        logger.info(f"Received signal {signum}, stopping directory syncer...")
-        self.stop()
 
     def start(self):
         """Start the background sync thread"""
@@ -40,7 +31,7 @@ class DirectorySyncer:
             return
 
         self._stop_event.set()
-        self._thread.join(timeout=1)  # Wait up to 30 seconds for the thread to finish
+        self._thread.join(timeout=2)  # Wait up to 30 seconds for the thread to finish
         if self._thread.is_alive():
             logger.warning("Directory syncer thread did not stop gracefully within timeout")
         self._thread = None
