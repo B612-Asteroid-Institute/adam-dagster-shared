@@ -177,6 +177,7 @@ def create_k8s_config(
             }
         )
 
+    # Since GKE doesn't create a taint on private nodes, we use our own custom taint and toleration
     if allow_private:
         spec["pod_spec_config"].setdefault("tolerations", []).append(
             {

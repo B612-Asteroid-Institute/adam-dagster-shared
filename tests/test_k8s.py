@@ -97,4 +97,41 @@ def test_create_k8s_config_with_custom_resources():
     assert config["container_config"]["resources"]["requests"] == {
         "cpu": "2000m",
         "memory": "4000Mi"
-    } 
+    }
+
+
+def test_create_k8s_config_with_required_labels_and_tolerations():
+    """Test configuration with required labels and allowed tolerations"""
+    config = create_k8s_config(
+        required_labels=["custom-label-1", "custom-label-2"],
+        allowed_tolerations=["custom-toleration-1", "custom-toleration-2"]
+    )
+    
+    # Check required labels in node affinity
+    node_selector_terms = config["pod_spec_config"]["affinity"]["node_affinity"][
+        "required_during_scheduling_ignored_during_execution"
+    ]["node_selector_terms"]
+    
+    assert len(node_selector_terms) == 2
+    assert {
+        "match_expressions": [{"key": "custom-label-1", "operator": "In", "values": ["true"]}]
+    } in node_selector_terms
+    assert {
+        "match_expressions": [{"key": "custom-label-2", "operator": "In", "values": ["true"]}]
+    } in node_selector_terms
+    
+    # Check tolerations
+    tolerations = config["pod_spec_config"]["tolerations"]
+    assert len(tolerations) == 2
+    assert {
+        "key": "custom-toleration-1",
+        "operator": "Equal",
+        "value": "true",
+        "effect": "NoSchedule"
+    } in tolerations
+    assert {
+        "key": "custom-toleration-2",
+        "operator": "Equal",
+        "value": "true",
+        "effect": "NoSchedule"
+    } in tolerations 
