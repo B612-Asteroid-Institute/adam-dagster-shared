@@ -144,28 +144,28 @@ def create_k8s_config(
         spec["container_config"]["resources"]["requests"][
             "ephemeral-storage"
         ] = f"{tmp_volume + 2000}Mi"
-        spec["container_config"]["volume_mounts"] = [
+        spec["container_config"].setdefault("volume_mounts", []).append(
             {
                 "name": "run-volume",
                 "mountPath": "/tmp",
             }
-        ]
-        spec["pod_spec_config"]["volumes"] = [
+        )
+        spec["pod_spec_config"].setdefault("volumes", []).append(
             {"name": "run-volume", "empty_dir": {"size_limit": f"{tmp_volume}Mi"}}
-        ]
+        )
 
     if shm_volume > 0:
         # Ensure we have enough memory for the shm volume
         assert memory > shm_volume, "Not enough memory for shm volume"
-        spec["container_config"]["volume_mounts"] = [
+        spec["container_config"].setdefault("volume_mounts", []).append(
             {"name": "shm-volume", "mountPath": "/dev/shm", "read_only": False}
-        ]
-        spec["pod_spec_config"]["volumes"] = [
+        )
+        spec["pod_spec_config"].setdefault("volumes", []).append(
             {
                 "name": "shm-volume",
                 "empty_dir": {"medium": "Memory", "size_limit": f"{shm_volume}Mi"},
             }
-        ]
+        )
 
     if allow_spot:
         spec["pod_spec_config"].setdefault("tolerations", []).append(

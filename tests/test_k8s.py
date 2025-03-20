@@ -134,4 +134,35 @@ def test_create_k8s_config_with_required_labels_and_tolerations():
         "operator": "Equal",
         "value": "true",
         "effect": "NoSchedule"
-    } in tolerations 
+    } in tolerations
+
+
+def test_create_k8s_config_with_both_volumes():
+    """Test configuration with both temporary and shared memory volumes"""
+    config = create_k8s_config(tmp_volume=1000, shm_volume=500, memory=2000)
+    
+    # Check ephemeral storage request
+    assert config["container_config"]["resources"]["requests"]["ephemeral-storage"] == "3000Mi"
+    
+    # Check volume mounts
+    assert len(config["container_config"]["volume_mounts"]) == 2
+    assert {
+        "name": "run-volume",
+        "mountPath": "/tmp",
+    } in config["container_config"]["volume_mounts"]
+    assert {
+        "name": "shm-volume",
+        "mountPath": "/dev/shm",
+        "read_only": False
+    } in config["container_config"]["volume_mounts"]
+    
+    # Check volumes
+    assert len(config["pod_spec_config"]["volumes"]) == 2
+    assert {
+        "name": "run-volume",
+        "empty_dir": {"size_limit": "1000Mi"}
+    } in config["pod_spec_config"]["volumes"]
+    assert {
+        "name": "shm-volume",
+        "empty_dir": {"medium": "Memory", "size_limit": "500Mi"}
+    } in config["pod_spec_config"]["volumes"] 
