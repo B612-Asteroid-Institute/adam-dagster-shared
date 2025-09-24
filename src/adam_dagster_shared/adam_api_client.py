@@ -6,10 +6,11 @@ from decimal import Decimal
 from typing import Any, Dict, Optional
 
 import requests
-from adam_dagster_shared.k8s import get_current_namespace, get_node_sa_kubernetes_client
 from kubernetes import client as k8s_client
 from kubernetes.client.rest import ApiException
 from pydantic import BaseModel, Field, field_validator
+
+from adam_dagster_shared.k8s import get_current_namespace, get_node_sa_kubernetes_client
 
 
 class JobUpdateWebhook(BaseModel):
@@ -150,22 +151,21 @@ class ADAMAPIClient:
             return False
 
     def _is_token_expired_response(self, response: requests.Response) -> bool:
-        """Check if a response indicates an expired access token.
+        """Check if a response indicates an expired or invalid access token.
 
         Args:
             response: The HTTP response to check
 
         Returns:
-            bool: True if the response indicates token expiration
+            bool: True if the response indicates token expiration or auth failure
         """
-        if response.status_code != 401:
+        # Handle both 401 (Unauthorized) and 403 (Forbidden) for auth issues
+        if response.status_code not in [401, 403]:
             return False
 
-        try:
-            error_data = response.json()
-            return error_data.get("error") == "token_expired"
-        except (ValueError, KeyError):
-            return False
+        # For 401/403 responses, assume it's an auth issue that can be resolved with token refresh
+        # This is more robust than checking for specific error message formats
+        return True
 
     def _execute_request(self, method: str, url: str, **kwargs) -> requests.Response:
         """Execute a single HTTP request.
