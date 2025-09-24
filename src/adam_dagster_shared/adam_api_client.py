@@ -151,21 +151,31 @@ class ADAMAPIClient:
             return False
 
     def _is_token_expired_response(self, response: requests.Response) -> bool:
-        """Check if a response indicates an expired or invalid access token.
+        """Check if a response indicates an expired access token.
 
         Args:
             response: The HTTP response to check
 
         Returns:
-            bool: True if the response indicates token expiration or auth failure
+            bool: True if the response indicates token expiration
         """
-        # Handle both 401 (Unauthorized) and 403 (Forbidden) for auth issues
-        if response.status_code not in [401, 403]:
+        if response.status_code != 401:
             return False
 
-        # For 401/403 responses, assume it's an auth issue that can be resolved with token refresh
-        # This is more robust than checking for specific error message formats
-        return True
+        # Try to check for specific token expiration indicators in the response
+        try:
+            error_data = response.json()
+            error_msg = error_data.get("error", "").lower()
+            detail_msg = error_data.get("detail", "").lower()
+            
+            # Check for various token expiration indicators
+            expiration_indicators = ["token_expired", "expired", "invalid_token", "token"]
+            return any(indicator in error_msg or indicator in detail_msg 
+                      for indicator in expiration_indicators)
+        except (ValueError, KeyError, AttributeError):
+            # If we can't parse the JSON or get error details, assume any 401 is token expiration
+            # This makes us more robust against API response format changes
+            return True
 
     def _execute_request(self, method: str, url: str, **kwargs) -> requests.Response:
         """Execute a single HTTP request.
