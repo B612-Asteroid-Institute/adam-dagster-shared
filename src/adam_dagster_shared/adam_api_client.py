@@ -6,10 +6,11 @@ from decimal import Decimal
 from typing import Any, Dict, Optional
 
 import requests
-from adam_dagster_shared.k8s import get_current_namespace, get_node_sa_kubernetes_client
 from kubernetes import client as k8s_client
 from kubernetes.client.rest import ApiException
 from pydantic import BaseModel, Field, field_validator
+
+from adam_dagster_shared.k8s import get_current_namespace, get_node_sa_kubernetes_client
 
 
 class JobUpdateWebhook(BaseModel):
@@ -161,11 +162,20 @@ class ADAMAPIClient:
         if response.status_code != 401:
             return False
 
+        # Try to check for specific token expiration indicators in the response
         try:
             error_data = response.json()
-            return error_data.get("error") == "token_expired"
-        except (ValueError, KeyError):
-            return False
+            error_msg = error_data.get("error", "").lower()
+            detail_msg = error_data.get("detail", "").lower()
+            
+            # Check for various token expiration indicators
+            expiration_indicators = ["token_expired", "expired", "invalid_token", "token"]
+            return any(indicator in error_msg or indicator in detail_msg 
+                      for indicator in expiration_indicators)
+        except (ValueError, KeyError, AttributeError):
+            # If we can't parse the JSON or get error details, assume any 401 is token expiration
+            # This makes us more robust against API response format changes
+            return True
 
     def _execute_request(self, method: str, url: str, **kwargs) -> requests.Response:
         """Execute a single HTTP request.
