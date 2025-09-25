@@ -478,20 +478,32 @@ def send_job_update(
             logging.error("Failed to get API client")
             return False
 
-        # Build and validate payload
+        # Build payload - only include fields with actual values
         payload = {
             "job_id": job_id,
-            "status": status,
-            "started_at": started_at,
-            "completed_at": completed_at,
-            "execution_duration_hours": execution_duration_hours,
-            "compute_cost_usd": compute_cost_usd,
-            "peak_memory_gb": peak_memory_gb,
-            "cpu_hours": cpu_hours,
-            "request_data": request_data,
-            "results": results,
-            "error_message": error_message,
+            "status": status
         }
+        
+        if started_at:
+            payload["started_at"] = started_at
+        if completed_at:
+            payload["completed_at"] = completed_at
+        if execution_duration_hours:
+            payload["execution_duration_hours"] = execution_duration_hours
+        if compute_cost_usd:
+            payload["compute_cost_usd"] = compute_cost_usd
+        if peak_memory_gb:
+            payload["peak_memory_gb"] = peak_memory_gb
+        if cpu_hours:
+            payload["cpu_hours"] = cpu_hours
+        if request_data:
+            payload["request_data"] = request_data
+        if results:
+            payload["results"] = results
+        if error_message:
+            payload["error_message"] = error_message
+
+        # Validate with Pydantic
         job_update_data = JobUpdateWebhook(**payload).model_dump(exclude_none=True, mode="json")
         
         # Prepare request
