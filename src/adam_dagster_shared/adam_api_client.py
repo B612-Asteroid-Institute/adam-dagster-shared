@@ -507,8 +507,8 @@ def send_job_update(
         # Make request
         response = requests.post(url, json=job_update_data, headers=headers)
         
-        # Retry on 401
-        if response.status_code == 401 and api_client.refresh_token:
+        # Retry on 401 (Unauthorized) or 400 (Bad Request with auth errors)
+        if response.status_code in [400, 401] and api_client.refresh_token:
             logging.info(f"Token expired for job {job_id}, refreshing and retrying...")
             api_client._access_token = None
             if api_client._refresh_access_token():
