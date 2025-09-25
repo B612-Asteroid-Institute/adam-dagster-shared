@@ -165,13 +165,22 @@ class ADAMAPIClient:
         # Try to check for specific token expiration indicators in the response
         try:
             error_data = response.json()
-            error_msg = error_data.get("error", "").lower()
-            detail_msg = error_data.get("detail", "").lower()
+            
+            # Check multiple common error fields for token expiration indicators
+            fields_to_check = [
+                error_data.get("error", "").lower(),
+                error_data.get("detail", "").lower(), 
+                error_data.get("error_description", "").lower(),
+                error_data.get("error_code", "").lower(),
+            ]
             
             # Check for various token expiration indicators
-            expiration_indicators = ["token_expired", "expired", "invalid_token", "token"]
-            return any(indicator in error_msg or indicator in detail_msg 
-                      for indicator in expiration_indicators)
+            expiration_indicators = ["token_expired", "expired", "invalid_token", "authentication_error"]
+            is_expired = any(indicator in field for field in fields_to_check for indicator in expiration_indicators)
+            
+            # Debug logging to help diagnose token expiration detection
+            logging.debug(f"Token expiration check - fields: {fields_to_check}, indicators found: {is_expired}")
+            return is_expired
         except (ValueError, KeyError, AttributeError):
             # If we can't parse the JSON or get error details, assume any 401 is token expiration
             # This makes us more robust against API response format changes
@@ -204,8 +213,17 @@ class ADAMAPIClient:
         Returns:
             Either the original response (if not expired) or the retry response
         """
+        # Add debug logging for diagnosis
+        is_expired = self._is_token_expired_response(response)
+        has_refresh_token = bool(self.refresh_token)
+        logging.info(f"Token expiration check - expired: {is_expired}, has_refresh_token: {has_refresh_token}, status: {response.status_code}")
+        
         # Pass through if not a token expiration or no refresh token available
-        if not self._is_token_expired_response(response) or not self.refresh_token:
+        if not is_expired or not has_refresh_token:
+            if not is_expired:
+                logging.info("Response not identified as token expiration - skipping retry")
+            if not has_refresh_token:
+                logging.warning("No refresh token available - cannot attempt token refresh")
             return response
 
         logging.info("Access token expired, attempting to refresh and retry request")
@@ -214,7 +232,7 @@ class ADAMAPIClient:
         self._access_token = None
         if self._refresh_access_token():
             retry_response = self._execute_request(method, url, **request_kwargs)
-            logging.info("Successfully retried request with refreshed token")
+            logging.info(f"Successfully retried request with refreshed token - new status: {retry_response.status_code}")
             return retry_response
         else:
             logging.error("Failed to refresh token after 401 response")
@@ -453,28 +471,19 @@ def send_job_update(
     results: Optional[Dict[str, Any]] = None,
     error_message: Optional[str] = None,
 ) -> bool:
-    """Send a job update to the ADAM API with Pydantic validation.
-
-    Args:
-        api_client: The API client instance to use for sending the update
-        **kwargs: Job update data that will be validated against JobUpdateWebhook schema
-
-    Returns:
-        bool: True if update sent successfully, False otherwise
-    """
+    """Send a job update to the ADAM API with simple token refresh retry logic."""
     try:
         api_client = get_adam_client()
-        
         if not api_client:
-            logging.error("Failed to get authenticated API client - cannot send job update")
+            logging.error("Failed to get API client")
             return False
 
-        # Generate the conditional payload. Only include the required fields and fields we want to update.
+        # Build payload - only include fields with actual values
         payload = {
             "job_id": job_id,
             "status": status
         }
-
+        
         if started_at:
             payload["started_at"] = started_at
         if completed_at:
@@ -494,24 +503,36 @@ def send_job_update(
         if error_message:
             payload["error_message"] = error_message
 
-        # Validate the input data using the Pydantic model
-        job_update = JobUpdateWebhook(**payload)
-        logging.info(f"Validated job update payload for {job_id}: {status}")
-
-        # Convert to dict for sending
-        job_update_data = job_update.model_dump(exclude_none=True, mode="json")
-        logging.debug(f"Job update data: {job_update_data}")
-
-        # Send the update using the API client
-        logging.info(f"Sending job update to /api/internal/job-update for {job_id}")
-        response = api_client.post("/api/internal/job-update", job_update_data)
+        # Validate with Pydantic
+        job_update_data = JobUpdateWebhook(**payload).model_dump(exclude_none=True, mode="json")
         
-        if response.status_code == 200:
+        # Prepare request
+        url = f"{api_client.base_url}/api/internal/job-update"
+        headers = {"Content-Type": "application/json"}
+        
+        # Get initial token if needed
+        if api_client.refresh_token and not api_client._access_token:
+            api_client._refresh_access_token()
+        if api_client._access_token:
+            headers["Authorization"] = f"Bearer {api_client._access_token}"
+
+        # Make request
+        response = requests.post(url, json=job_update_data, headers=headers)
+        
+        # Retry on 401 (Unauthorized) or 400 (Bad Request with auth errors)
+        if response.status_code in [400, 401] and api_client.refresh_token:
+            logging.info(f"Token expired for job {job_id}, refreshing and retrying...")
+            api_client._access_token = None
+            if api_client._refresh_access_token():
+                headers["Authorization"] = f"Bearer {api_client._access_token}"
+                response = requests.post(url, json=job_update_data, headers=headers)
+        
+        success = response.status_code == 200
+        if success:
             logging.info(f"Successfully sent job update for {job_id}: {status}")
-            return True
         else:
-            logging.error(f"Failed to send job update for {job_id}. Status: {response.status_code}, Response: {response.text}")
-            return False
+            logging.error(f"Failed job update for {job_id}: {response.status_code} {response.text}")
+        return success
 
     except Exception as e:
         logging.exception(f"Failed to send job update: {e}")
