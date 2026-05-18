@@ -10,14 +10,10 @@ dependencies = [
     "kubernetes>=31.0.0",
     "google-auth>=2.37.0",
     "dagster>=1.8.7",
-    "click>=8.1.7"
 ]
 requires-python = "<3.13,>=3.11"
 readme = "README.md"
 license = {text = "MIT"}
-
-[project.scripts]
-adam-dagster = "adam_dagster_shared.cli:cli"
 
 [project.optional-dependencies]
 test = [
