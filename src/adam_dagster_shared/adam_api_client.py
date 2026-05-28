@@ -51,7 +51,7 @@ class JobUpdateWebhook(BaseModel):
         # Valid statuses based on Django Job.Status.choices (lowercase)
         valid_statuses = [
             "pending",
-            "queued", 
+            "queued",
             "starting",
             "running",
             "success",
@@ -63,13 +63,12 @@ class JobUpdateWebhook(BaseModel):
         return v
 
 
-
 class ADAMAPIClient:
     """Client for communicating with the ADAM API server."""
-    
+
     def __init__(self, host: str, port: int, refresh_token: Optional[str] = None):
         """Initialize the API client with host, port, and optional refresh token.
-        
+
         Args:
             host: The API server hostname or IP address
             port: The API server port number
@@ -82,7 +81,7 @@ class ADAMAPIClient:
             None  # Hidden state for current access token
         )
         self.base_url = f"http://{host}:{port}"
-        
+
         # Set up session with default headers
         self.session = requests.Session()
         self.session.headers.update(
@@ -165,21 +164,32 @@ class ADAMAPIClient:
         # Try to check for specific token expiration indicators in the response
         try:
             error_data = response.json()
-            
+
             # Check multiple common error fields for token expiration indicators
             fields_to_check = [
                 error_data.get("error", "").lower(),
-                error_data.get("detail", "").lower(), 
+                error_data.get("detail", "").lower(),
                 error_data.get("error_description", "").lower(),
                 error_data.get("error_code", "").lower(),
             ]
-            
+
             # Check for various token expiration indicators
-            expiration_indicators = ["token_expired", "expired", "invalid_token", "authentication_error"]
-            is_expired = any(indicator in field for field in fields_to_check for indicator in expiration_indicators)
-            
+            expiration_indicators = [
+                "token_expired",
+                "expired",
+                "invalid_token",
+                "authentication_error",
+            ]
+            is_expired = any(
+                indicator in field
+                for field in fields_to_check
+                for indicator in expiration_indicators
+            )
+
             # Debug logging to help diagnose token expiration detection
-            logging.debug(f"Token expiration check - fields: {fields_to_check}, indicators found: {is_expired}")
+            logging.debug(
+                f"Token expiration check - fields: {fields_to_check}, indicators found: {is_expired}"
+            )
             return is_expired
         except (ValueError, KeyError, AttributeError):
             # If we can't parse the JSON or get error details, assume any 401 is token expiration
@@ -216,14 +226,20 @@ class ADAMAPIClient:
         # Add debug logging for diagnosis
         is_expired = self._is_token_expired_response(response)
         has_refresh_token = bool(self.refresh_token)
-        logging.info(f"Token expiration check - expired: {is_expired}, has_refresh_token: {has_refresh_token}, status: {response.status_code}")
-        
+        logging.info(
+            f"Token expiration check - expired: {is_expired}, has_refresh_token: {has_refresh_token}, status: {response.status_code}"
+        )
+
         # Pass through if not a token expiration or no refresh token available
         if not is_expired or not has_refresh_token:
             if not is_expired:
-                logging.info("Response not identified as token expiration - skipping retry")
+                logging.info(
+                    "Response not identified as token expiration - skipping retry"
+                )
             if not has_refresh_token:
-                logging.warning("No refresh token available - cannot attempt token refresh")
+                logging.warning(
+                    "No refresh token available - cannot attempt token refresh"
+                )
             return response
 
         logging.info("Access token expired, attempting to refresh and retry request")
@@ -232,7 +248,9 @@ class ADAMAPIClient:
         self._access_token = None
         if self._refresh_access_token():
             retry_response = self._execute_request(method, url, **request_kwargs)
-            logging.info(f"Successfully retried request with refreshed token - new status: {retry_response.status_code}")
+            logging.info(
+                f"Successfully retried request with refreshed token - new status: {retry_response.status_code}"
+            )
             return retry_response
         else:
             logging.error("Failed to refresh token after 401 response")
@@ -246,16 +264,16 @@ class ADAMAPIClient:
         params: Optional[Dict[str, Any]] = None,
     ) -> requests.Response:
         """Make an HTTP request to the API server with automatic token refresh.
-        
+
         Args:
             endpoint: API endpoint path (e.g., "/api/v1/jobs")
             method: HTTP method (GET, POST, PUT, DELETE)
             data: Request data for POST/PUT requests
             params: Query parameters for GET requests
-            
+
         Returns:
             HTTP response
-            
+
         Raises:
             requests.RequestException: If the request fails
         """
@@ -275,50 +293,50 @@ class ADAMAPIClient:
         self, endpoint: str, params: Optional[Dict[str, Any]] = None
     ) -> requests.Response:
         """Make a GET request.
-        
+
         Args:
             endpoint: API endpoint path
             params: Query parameters
-            
+
         Returns:
             JSON response as a dictionary
         """
         return self._make_request(endpoint, "GET", params=params)
-    
+
     def post(
         self, endpoint: str, data: Optional[Dict[str, Any]] = None
     ) -> requests.Response:
         """Make a POST request.
-        
+
         Args:
             endpoint: API endpoint path
             data: Request body data
-            
+
         Returns:
             JSON response as a dictionary
         """
         return self._make_request(endpoint, "POST", data=data)
-    
+
     def put(
         self, endpoint: str, data: Optional[Dict[str, Any]] = None
     ) -> requests.Response:
         """Make a PUT request.
-        
+
         Args:
             endpoint: API endpoint path
             data: Request body data
-            
+
         Returns:
             JSON response as a dictionary
         """
         return self._make_request(endpoint, "PUT", data=data)
-    
+
     def delete(self, endpoint: str) -> requests.Response:
         """Make a DELETE request.
-        
+
         Args:
             endpoint: API endpoint path
-            
+
         Returns:
             JSON response as a dictionary
         """
@@ -352,20 +370,60 @@ class ADAMAPIClient:
 def initialize_adam_api_client(
     host: str | None = None, port: int | None = None, refresh_token: str | None = None
 ) -> ADAMAPIClient:
-    """Initialize the ADAM API client using Kubernetes service DNS with namespace.
+    """Initialize the ADAM API client.
 
-    Host is constructed using the standard Kubernetes DNS format:
-    <service>.<namespace>.svc.cluster.local
+    Resolution order:
+    1. If the ``ADAM_API_BASE_URL`` env var is set and the caller did not pass
+       ``host``/``port`` explicitly, parse host+port (and scheme) from it.
+       Used for local development where the API is not behind a Kubernetes
+       service.
+    2. Otherwise, construct the host using Kubernetes service DNS:
+       ``<service>.<namespace>.svc.cluster.local`` where the service name
+       defaults to ``adam-api`` and can be overridden via
+       ``ADAM_API_SERVICE_NAME``. Port is taken from the argument, or
+       ``ADAM_API_SERVICE_PORT``, or 80.
 
-    - Service name defaults to "adam-api" and can be overridden via ADAM_API_SERVICE_NAME
-    - Port is taken from the provided argument, or ADAM_API_SERVICE_PORT, or defaults to 80
+    The ``refresh_token`` argument falls back to the ``ADAM_API_REFRESH_TOKEN``
+    env var when not provided, so local development can configure
+    authentication purely via the environment.
 
-    Returns an unauthenticated client. For authenticated access in Kubernetes deployments,
-    use create_authenticated_adam_api_client() instead.
+    Returns an unauthenticated client (or one configured to refresh on demand
+    when a refresh token is supplied). For Kubernetes-deployed callers that
+    need to read the refresh token from a cluster secret, use
+    ``create_authenticated_adam_api_client()`` instead.
 
     Returns:
-        AdamApiClient: Configured API client instance (unauthenticated)
+        AdamApiClient: Configured API client instance.
     """
+    if refresh_token is None:
+        refresh_token = os.getenv("ADAM_API_REFRESH_TOKEN") or None
+
+    base_url_override = (
+        os.getenv("ADAM_API_BASE_URL") if host is None and port is None else None
+    )
+
+    if base_url_override:
+        # Local-dev / explicit-URL path: use the URL verbatim, skipping k8s DNS.
+        from urllib.parse import urlparse
+
+        parsed = urlparse(base_url_override)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(
+                f"ADAM_API_BASE_URL must start with http:// or https://, got: {base_url_override}"
+            )
+        if not parsed.hostname:
+            raise ValueError(
+                f"ADAM_API_BASE_URL must include a host, got: {base_url_override}"
+            )
+        default_port = 443 if parsed.scheme == "https" else 80
+        client = ADAMAPIClient(
+            parsed.hostname, parsed.port or default_port, refresh_token=refresh_token
+        )
+        # ADAMAPIClient hardcodes the scheme to http://; preserve the requested URL
+        # exactly so https and non-default ports keep working.
+        client.base_url = base_url_override.rstrip("/")
+        return client
+
     if host is None:
         try:
             namespace = get_current_namespace()
@@ -402,7 +460,7 @@ def create_authenticated_adam_api_client() -> ADAMAPIClient:
 
     Returns:
         AdamApiClient: Authenticated API client
-        
+
     Raises:
         ValueError: If required environment variables are missing
         Exception: If cluster connection or secret reading fails
@@ -413,10 +471,14 @@ def create_authenticated_adam_api_client() -> ADAMAPIClient:
 
     # Get Kubernetes API client and read secret
     cluster = "adam-prod" if namespace == "production" else "adam-dev"
-    api_client = get_node_sa_kubernetes_client("moeyens-thor-dev", "us-west1-a", cluster)
+    api_client = get_node_sa_kubernetes_client(
+        "moeyens-thor-dev", "us-west1-a", cluster
+    )
     v1 = k8s_client.CoreV1Api(api_client)
-    
-    secret = v1.read_namespaced_secret(name="dagster-adam-api-token", namespace=namespace)
+
+    secret = v1.read_namespaced_secret(
+        name="dagster-adam-api-token", namespace=namespace
+    )
 
     # Decode the refresh token
     secret_key = "refresh-token"
@@ -443,9 +505,22 @@ _adam_api_client: Optional[ADAMAPIClient] = None
 
 
 def get_adam_client() -> Optional[ADAMAPIClient]:
-    """Get or create the global ADAM API client instance."""
+    """Get or create the global ADAM API client instance.
+
+    When ``ADAM_API_BASE_URL`` is set (local development), build the client
+    from the env-driven URL and skip the Kubernetes secret lookup entirely.
+    Authentication is optional in that mode and is configured via
+    ``ADAM_API_REFRESH_TOKEN``.
+    """
     global _adam_api_client
     if _adam_api_client is None:
+        if os.getenv("ADAM_API_BASE_URL"):
+            _adam_api_client = initialize_adam_api_client()
+            logging.info(
+                "Created ADAM API client from ADAM_API_BASE_URL: %s",
+                _adam_api_client.base_url,
+            )
+            return _adam_api_client
         try:
             logging.info("Creating authenticated ADAM API client...")
             _adam_api_client = create_authenticated_adam_api_client()
@@ -454,8 +529,6 @@ def get_adam_client() -> Optional[ADAMAPIClient]:
             logging.error(f"Failed to create authenticated ADAM API client: {e}")
             return None
     return _adam_api_client
-
-
 
 
 def send_job_update(
@@ -479,11 +552,8 @@ def send_job_update(
             return False
 
         # Build payload - only include fields with actual values
-        payload = {
-            "job_id": job_id,
-            "status": status
-        }
-        
+        payload = {"job_id": job_id, "status": status}
+
         if started_at:
             payload["started_at"] = started_at
         if completed_at:
@@ -504,12 +574,14 @@ def send_job_update(
             payload["error_message"] = error_message
 
         # Validate with Pydantic
-        job_update_data = JobUpdateWebhook(**payload).model_dump(exclude_none=True, mode="json")
-        
+        job_update_data = JobUpdateWebhook(**payload).model_dump(
+            exclude_none=True, mode="json"
+        )
+
         # Prepare request
         url = f"{api_client.base_url}/api/internal/job-update"
         headers = {"Content-Type": "application/json"}
-        
+
         # Get initial token if needed
         if api_client.refresh_token and not api_client._access_token:
             api_client._refresh_access_token()
@@ -518,7 +590,7 @@ def send_job_update(
 
         # Make request
         response = requests.post(url, json=job_update_data, headers=headers)
-        
+
         # Retry on 401 (Unauthorized) or 400 (Bad Request with auth errors)
         if response.status_code in [400, 401] and api_client.refresh_token:
             logging.info(f"Token expired for job {job_id}, refreshing and retrying...")
@@ -526,14 +598,16 @@ def send_job_update(
             if api_client._refresh_access_token():
                 headers["Authorization"] = f"Bearer {api_client._access_token}"
                 response = requests.post(url, json=job_update_data, headers=headers)
-        
+
         success = response.status_code == 200
         if success:
             logging.info(f"Successfully sent job update for {job_id}: {status}")
         else:
-            logging.error(f"Failed job update for {job_id}: {response.status_code} {response.text}")
+            logging.error(
+                f"Failed job update for {job_id}: {response.status_code} {response.text}"
+            )
         return success
 
     except Exception as e:
         logging.exception(f"Failed to send job update: {e}")
-        return False 
+        return False
