@@ -29,6 +29,21 @@ def get_node_sa_kubernetes_client(project_id, zone, cluster_id) -> client.ApiCli
     configuration.api_key["authorization"] = creds.token
     configuration.client_side_validation = False
 
+    # Auto-refresh the GCP OAuth token before each request. The kubernetes client
+    # invokes refresh_api_key_hook(configuration) inside get_api_key_with_prefix()
+    # ahead of every API call. google.auth's creds.valid is False once the token
+    # has expired (or is within the refresh skew), so we only hit the token
+    # endpoint when a refresh is actually needed. Without this hook the token
+    # fetched above is frozen into configuration.api_key, so a long-lived client
+    # (e.g. the sharded poll loop's read_namespaced_job calls) starts returning
+    # 401 once that token's TTL elapses.
+    def _refresh_api_key(config: client.Configuration) -> None:
+        if not creds.valid:
+            creds.refresh(auth_req)
+        config.api_key["authorization"] = creds.token
+
+    configuration.refresh_api_key_hook = _refresh_api_key
+
     # Return the ApiClient while the temporary file is still open
     return client.ApiClient(configuration)
 
