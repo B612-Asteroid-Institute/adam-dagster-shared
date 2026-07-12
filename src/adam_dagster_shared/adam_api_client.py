@@ -342,6 +342,81 @@ class ADAMAPIClient:
         """
         return self._make_request(endpoint, "DELETE")
 
+    @staticmethod
+    def workload_credential() -> Optional[str]:
+        """Dedicated least-privilege machine credential, when provisioned.
+
+        Sourced from ``ADAM_API_WORKLOAD_CREDENTIAL`` (mounted from a K8s
+        Secret in cluster deployments). ``None`` means the caller should use
+        the legacy refresh-token identity.
+        """
+        value = (os.getenv("ADAM_API_WORKLOAD_CREDENTIAL") or "").strip()
+        return value or None
+
+    def post_with_workload(
+        self, endpoint: str, data: Optional[Dict[str, Any]] = None
+    ) -> Optional[requests.Response]:
+        """POST to an internal endpoint as the workload principal.
+
+        Returns ``None`` when no workload credential is configured so callers
+        can fall back to the legacy identity explicitly.
+        """
+        credential = self.workload_credential()
+        if credential is None:
+            return None
+        url = f"{self.base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+        return self.session.request(
+            method="POST",
+            url=url,
+            json=data,
+            headers={"Authorization": f"Workload {credential}"},
+        )
+
+    def post_with_delegation(
+        self,
+        endpoint: str,
+        data: Optional[Dict[str, Any]],
+        delegation_token: str,
+    ) -> requests.Response:
+        """POST to a public endpoint AS the delegated origin user/org."""
+        url = f"{self.base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+        return self.session.request(
+            method="POST",
+            url=url,
+            json=data,
+            headers={"Authorization": f"Delegation {delegation_token}"},
+        )
+
+    def request_job_delegation(
+        self,
+        origin_job_id: str,
+        scopes: list[str],
+        ttl_seconds: int = 600,
+    ) -> Optional[str]:
+        """Mint a short-lived single-use delegation from an origin job.
+
+        The server derives the user/organization from the origin job; this
+        client can never choose them. Returns ``None`` when the workload
+        credential is not configured or issuance fails (callers fall back to
+        the legacy automation identity and log the attribution gap).
+        """
+        response = self.post_with_workload(
+            f"/api/internal/jobs/{origin_job_id}/delegations/",
+            {"scopes": list(scopes), "ttl_seconds": int(ttl_seconds)},
+        )
+        if response is None:
+            return None
+        if response.status_code != 200:
+            logging.warning(
+                "Job delegation issuance failed origin_job_id=%s status=%s body=%s",
+                origin_job_id,
+                response.status_code,
+                response.text[:200],
+            )
+            return None
+        token = response.json().get("token")
+        return token if isinstance(token, str) and token else None
+
     def authenticate_with_refresh_token(self, refresh_token: str) -> bool:
         """Authenticate using a refresh token to get an access token.
 
@@ -494,6 +569,17 @@ def create_authenticated_adam_api_client() -> ADAMAPIClient:
     encoded_token = secret.data[secret_key]
     refresh_token = base64.b64decode(encoded_token).decode("utf-8")
 
+    # Optional least-privilege workload credential (personal-rqe.3), delivered
+    # through the SAME secret so no new mounts/hard dependencies are added.
+    # An explicit ADAM_API_WORKLOAD_CREDENTIAL env var always wins; absence of
+    # the key simply keeps the legacy refresh-token identity.
+    workload_encoded = (secret.data or {}).get("workload-credential")
+    if workload_encoded and not os.getenv("ADAM_API_WORKLOAD_CREDENTIAL"):
+        os.environ["ADAM_API_WORKLOAD_CREDENTIAL"] = base64.b64decode(
+            workload_encoded
+        ).decode("utf-8")
+        logging.info("Loaded workload credential from dagster-adam-api-token secret")
+
     # Initialize and return API client with the refresh token
     client = initialize_adam_api_client(refresh_token=refresh_token)
     logging.info("Successfully initialized ADAM API client with refresh token")
@@ -582,20 +668,40 @@ def send_job_update(
         url = f"{api_client.base_url}/api/internal/job-update"
         headers = {"Content-Type": "application/json"}
 
-        # Get initial token if needed
-        if api_client.refresh_token and not api_client._access_token:
-            api_client._refresh_access_token()
-        if api_client._access_token:
-            headers["Authorization"] = f"Bearer {api_client._access_token}"
+        # Prefer the dedicated least-privilege workload credential; the
+        # legacy staff refresh token remains the transitional fallback.
+        workload_credential = api_client.workload_credential()
+        if workload_credential:
+            headers["Authorization"] = f"Workload {workload_credential}"
+        else:
+            # Get initial token if needed
+            if api_client.refresh_token and not api_client._access_token:
+                api_client._refresh_access_token()
+            if api_client._access_token:
+                headers["Authorization"] = f"Bearer {api_client._access_token}"
 
         # Make request
         response = requests.post(url, json=job_update_data, headers=headers)
 
         # Retry on 401 (Unauthorized) or 400 (Bad Request with auth errors)
-        if response.status_code in [400, 401] and api_client.refresh_token:
+        if (
+            response.status_code in [400, 401]
+            and not workload_credential
+            and api_client.refresh_token
+        ):
             logging.info(f"Token expired for job {job_id}, refreshing and retrying...")
             api_client._access_token = None
             if api_client._refresh_access_token():
+                headers["Authorization"] = f"Bearer {api_client._access_token}"
+                response = requests.post(url, json=job_update_data, headers=headers)
+        elif response.status_code in [401, 403] and workload_credential:
+            # Transitional resilience: a not-yet-seeded credential must not
+            # freeze job updates while the legacy token still works.
+            logging.warning(
+                "Workload credential rejected for job update %s; retrying legacy",
+                job_id,
+            )
+            if api_client.refresh_token and api_client._refresh_access_token():
                 headers["Authorization"] = f"Bearer {api_client._access_token}"
                 response = requests.post(url, json=job_update_data, headers=headers)
 
