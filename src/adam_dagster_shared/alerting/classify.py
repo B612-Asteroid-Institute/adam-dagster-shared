@@ -119,24 +119,18 @@ def classify(ctx: FailureContext) -> Verdict:
             exception=_display(cls, msg),
         )
 
-    # Rule: k8s job death (spot preemption / eviction / node reclaim). No
-    # exception chain exists — the pod is simply gone. Self-heals via retry
-    # policies and automation re-requests; digest-tier unless rates spike
-    # (rate excursions are the digest's job to surface).
-    if any(marker in all_msgs for marker in _K8S_DEATH_MARKERS):
-        sf = ctx.step_failures[0]
-        return Verdict(
-            tier=Tier.DIGEST,
-            klass="k8s-job-death",
-            reason="step pod died (spot/eviction/reclaim), retries exhausted",
-            signature=fingerprint(ctx.job_name, sf.step_key, "K8sJobDeath", ""),
-            step_key=sf.step_key,
-            exception=_display(None, sf.innermost_msg),
-        )
+    def _step_matching(markers) -> "StepFailure | None":
+        for sf in ctx.step_failures:
+            if any(m in " | ".join(sf.msg_chain).lower() for m in markers):
+                return sf
+        return None
 
     # Rule: system OOM (user OOM is caught by the user-api rule above).
+    # Checked BEFORE the generic k8s-death markers: an OOM-killed pod also
+    # matches the broad failed-job phrases, and the most severe specific
+    # evidence must win over a generic fallback (review finding R12).
     if any(marker in all_msgs for marker in _OOM_MARKERS):
-        sf = ctx.step_failures[0] if ctx.step_failures else None
+        sf = _step_matching(_OOM_MARKERS) or (ctx.step_failures[0] if ctx.step_failures else None)
         cls, msg = _real_exception(sf) if sf else (None, "oom")
         return Verdict(
             tier=Tier.PAGE,
@@ -145,6 +139,21 @@ def classify(ctx: FailureContext) -> Verdict:
             signature=fingerprint(ctx.job_name, sf.step_key if sf else None, "OOM", msg),
             step_key=sf.step_key if sf else None,
             exception=_display(cls, msg),
+        )
+
+    # Rule: k8s job death (eviction / node reclaim / preemption — the phrase
+    # alone does not establish which). No exception chain exists — the pod is
+    # simply gone. Self-heals via retry policies and automation re-requests;
+    # digest-tier unless rates spike (rate excursions are the digest's job).
+    if any(marker in all_msgs for marker in _K8S_DEATH_MARKERS):
+        sf = _step_matching(_K8S_DEATH_MARKERS) or ctx.step_failures[0]
+        return Verdict(
+            tier=Tier.DIGEST,
+            klass="k8s-job-death",
+            reason="step pod died (eviction/reclaim/preemption), retries exhausted",
+            signature=fingerprint(ctx.job_name, sf.step_key, "K8sJobDeath", ""),
+            step_key=sf.step_key,
+            exception=_display(None, sf.innermost_msg),
         )
 
     # Rule: interrupted mid-execution (evictions/terminations surfacing as

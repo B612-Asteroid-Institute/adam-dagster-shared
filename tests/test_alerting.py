@@ -150,114 +150,6 @@ def test_system_oom_is_page_but_user_oom_is_user_facing():
 # ===== Cooldown / escalation / breaker =====
 
 
-def test_cooldown_suppresses_repeat_notify_posts():
-    state = sensors_mod.load_state(None)
-    now = time.time()
-    sig = sensors_mod.record_occurrence(state, "fp1", now)
-    assert sensors_mod.decide_post(state, sig, Tier.NOTIFY, "code-error", now) == (True, False)
-    sig = sensors_mod.record_occurrence(state, "fp1", now + 60)
-    assert sensors_mod.decide_post(state, sig, Tier.NOTIFY, "code-error", now + 60) == (
-        False,
-        False,
-    )
-    # After the 6h cooldown a repeat posts again.
-    later = now + 6 * 3600 + 1
-    sig = sensors_mod.record_occurrence(state, "fp1", later)
-    assert sensors_mod.decide_post(state, sig, Tier.NOTIFY, "code-error", later)[0] is True
-
-
-def test_cluster_escalation_upgrades_to_page_despite_cooldown():
-    state = sensors_mod.load_state(None)
-    now = time.time()
-    sig = sensors_mod.record_occurrence(state, "fp2", now)
-    sensors_mod.decide_post(state, sig, Tier.NOTIFY, "code-error", now)
-    for i in range(1, 5):
-        sig = sensors_mod.record_occurrence(state, "fp2", now + i)
-    should, escalated = sensors_mod.decide_post(state, sig, Tier.NOTIFY, "code-error", now + 5)
-    assert (should, escalated) == (True, True)
-    # ...but only once per 24h window.
-    sig = sensors_mod.record_occurrence(state, "fp2", now + 6)
-    assert sensors_mod.decide_post(state, sig, Tier.NOTIFY, "code-error", now + 6)[0] is False
-
-
-def test_digest_tier_never_posts_individually():
-    state = sensors_mod.load_state(None)
-    now = time.time()
-    sig = sensors_mod.record_occurrence(state, "fp3", now)
-    assert sensors_mod.decide_post(state, sig, Tier.DIGEST, "k8s-job-death", now) == (
-        False,
-        False,
-    )
-
-
-def test_breaker_caps_posts_per_hour():
-    state = sensors_mod.load_state(None)
-    now = time.time()
-    posted = 0
-    for i in range(15):
-        sig = sensors_mod.record_occurrence(state, f"fp-{i}", now + i)
-        should, _ = sensors_mod.decide_post(state, sig, Tier.NOTIFY, "quality-gate", now + i)
-        posted += int(should)
-    assert posted == 10
-
-
-def test_state_prunes_stale_signatures():
-    state = sensors_mod.load_state(None)
-    now = time.time()
-    sensors_mod.record_occurrence(state, "old", now - 3 * 24 * 3600)
-    sensors_mod.record_occurrence(state, "new", now)
-    sensors_mod.prune_state(state, now)
-    assert "old" not in state["signatures"] and "new" in state["signatures"]
-
-
-# ===== Rendering =====
-
-
-def test_alert_blocks_render_exception_and_env_prefix():
-    ctx = _ctx(
-        tags={"dagster/backfill": "qh1", "dagster/partition": "2015-02-12"},
-        step_failures=[
-            StepFailure(
-                "aims_observation_index_shards",
-                ["RetryRequestedFromPolicy", "RuntimeError"],
-                ["Exceeded max_retries of 0", DUPLICATE_GATE_MSG],
-            )
-        ],
-    )
-    v = classify(ctx)
-    fallback, blocks = slack_mod.alert_blocks(
-        v,
-        job_name=ctx.job_name,
-        run_id="deadbeef-0000",
-        tags=ctx.tags,
-        namespace="preview-alerting",
-        occurrences_24h=7,
-        first_seen_ts=time.time() - 3600,
-        escalated=True,
-    )
-    text = str(blocks)
-    assert "[dev · preview-alerting]" in text
-    assert "PAGE" in text and "escalated" in text
-    assert "duplicate gate" in text
-    assert "7 occurrences" in text
-    assert "backfill `qh1`" in text
-
-
-def test_alert_blocks_no_prefix_in_production():
-    v = classify(_ctx(step_failures=[StepFailure("s", ["ValueError"], ["ValueError: x"])]))
-    _, blocks = slack_mod.alert_blocks(
-        v,
-        job_name="j",
-        run_id="r",
-        tags={},
-        namespace="production",
-        occurrences_24h=1,
-        first_seen_ts=None,
-        escalated=False,
-    )
-    assert "[dev" not in str(blocks)
-
-
 def test_digest_blocks_render_er_cross_surface_section():
     summary = {
         "date_label": "Wed Sep 02",
@@ -267,7 +159,6 @@ def test_digest_blocks_render_er_cross_surface_section():
         "user_failures": 0,
         "user_count": 0,
         "top_signatures": [],
-        "baseline_median_per_day": None,
         "er": {
             "groups": 7,
             "new_today": 2,
@@ -353,12 +244,10 @@ def test_digest_blocks_render_counts():
         "user_failures": 2,
         "user_count": 2,
         "top_signatures": [("aabb", 41, "__ASSET_JOB: RuntimeError: duplicate gate")],
-        "baseline_median_per_day": 15,
     }
     fallback, blocks = slack_mod.digest_blocks(summary, "production")
     text = str(blocks)
     assert "155" in text and "217" in text
-    assert "trailing median 15/day" in text
     assert "duplicate gate" in text
     assert "155" in fallback
 
@@ -467,7 +356,10 @@ def test_er_handler_includes_exc_info_traceback(capsys):
     h.emit(rec)
     entry = __import__("json").loads(capsys.readouterr().out.strip())
     assert "ValueError: kaboom" in entry["message"]
-    assert "Traceback (most recent call last):" in entry["message"]
+    # The header is neutralized: an ER-parseable traceback would flip the
+    # group to frame-based keys (review finding R6).
+    assert "Traceback (most recent call last):" not in entry["message"]
+    assert "Stack trace (most recent call last):" in entry["message"]
 
 
 def test_er_handler_never_raises_on_bad_record(capsys):

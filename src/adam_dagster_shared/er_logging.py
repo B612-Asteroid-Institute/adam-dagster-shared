@@ -72,21 +72,51 @@ def _enabled() -> bool:
     return os.environ.get("ER_LOGGING_ENABLED", "").strip().lower() in ("1", "true", "yes")
 
 
+def current_namespace() -> str:
+    """The k8s namespace this process runs in — the single shared resolution.
+
+    Env first (GARDEN_NAMESPACE, then generic k8s vars), then the mounted
+    serviceaccount file, then "local". Every alerting component uses this
+    one helper so service names cannot drift between bridges.
+    """
+    for env_var in ("GARDEN_NAMESPACE", "K8S_NAMESPACE", "KUBERNETES_NAMESPACE"):
+        value = os.environ.get(env_var)
+        if value and value.strip():
+            return value.strip()
+    try:
+        with open(_NAMESPACE_PATH) as f:
+            return f.read().strip()
+    except OSError:
+        return "local"
+
+
 def _service_context() -> dict:
-    namespace = os.environ.get("GARDEN_NAMESPACE", "").strip()
-    if not namespace:
-        try:
-            with open(_NAMESPACE_PATH) as f:
-                namespace = f.read().strip()
-        except OSError:
-            namespace = "local"
+    """Resolved at emit time, not handler construction.
+
+    The bridge may be installed by a package bootstrap before the entrypoint
+    sets its identity (e.g. the shard entrypoint's ER_SERVICE_NAME default),
+    so reading env lazily is required for correct attribution.
+    """
     service = os.environ.get("ER_SERVICE_NAME", "").strip() or "service"
     version = (
         os.environ.get("ER_SERVICE_VERSION", "").strip()
         or os.environ.get("GARDEN_ACTION_VERSION", "").strip()
         or "unknown"
     )
-    return {"service": f"{namespace}/{service}", "version": version}
+    return {"service": f"{current_namespace()}/{service}", "version": version}
+
+
+def neutralize_stack(text: str) -> str:
+    """Rewrite every traceback header ER's parser keys on.
+
+    A chained ``raise Outer from inner`` prints multiple
+    ``Traceback (most recent call last):`` headers; leaving any of them
+    intact flips ER to frame-based grouping, which merges unrelated errors
+    through shared framework frames. Human readability is preserved.
+    """
+    return text.replace(
+        "Traceback (most recent call last):", "Stack trace (most recent call last):"
+    )
 
 
 def normalize_path(path: str) -> str:
@@ -101,11 +131,7 @@ def normalize_path(path: str) -> str:
 
 
 def _stack_text(exc_info) -> str:
-    """Traceback with the header ER's parser keys on rewritten (see module doc)."""
-    text = "".join(traceback.format_exception(*exc_info))
-    return text.replace(
-        "Traceback (most recent call last):", "Stack trace (most recent call last):", 1
-    )
+    return neutralize_stack("".join(traceback.format_exception(*exc_info)))
 
 
 def _request_bits(record: logging.LogRecord) -> dict:
@@ -151,12 +177,15 @@ class ErrorReportingHandler(logging.Handler):
 
     def __init__(self, level: int | str = logging.ERROR):
         super().__init__(level=level)
-        self._service_context = _service_context()
-        self._enabled = _enabled()
+
+    @property
+    def _enabled(self) -> bool:
+        return _enabled()
 
     def emit(self, record: logging.LogRecord) -> None:
-        if not self._enabled:
+        if not _enabled():
             return
+        self._service_context = _service_context()
         try:
             # django.request without exc_info is Django's response-status echo
             # — the exception itself was already reported (see module doc).

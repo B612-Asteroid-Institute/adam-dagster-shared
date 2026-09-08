@@ -30,6 +30,31 @@ _ER_BASE = "https://clouderrorreporting.googleapis.com/v1beta1"
 _PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "moeyens-thor-dev")
 _ANNOUNCED_CAP = 500  # ids kept in the cursor before pruning oldest
 _EXCERPT_BUDGET = 1800  # stack chars shown in Slack (section text caps at 3000)
+_PAGE_CAP = 10  # groupStats pages followed per fetch (100 groups each)
+_POST_BUDGET_PER_TICK = 10  # delivery attempts per tick; overflow stays pending
+
+
+def _fetch_group_stats_pages(period: str, extra: dict | None = None) -> tuple[list, bool]:
+    """All groupStats pages up to the cap. Returns (stats, complete).
+
+    ER orders by occurrence count by default, so without pagination 100
+    noisy existing groups anywhere in the shared project would keep a new
+    one-event failure off the page indefinitely.
+    """
+    stats: list = []
+    token = ""
+    for _ in range(_PAGE_CAP):
+        params = {"timeRange.period": period, "pageSize": 100}
+        if extra:
+            params.update(extra)
+        if token:
+            params["pageToken"] = token
+        page = _er_get("groupStats", params)
+        stats.extend(page.get("errorGroupStats", []))
+        token = page.get("nextPageToken", "")
+        if not token:
+            return stats, True
+    return stats, False
 
 # Body lines that restate what the headline already says; dropped from the
 # excerpt so the code block leads with signal instead of boilerplate.
@@ -128,42 +153,61 @@ def fetch_er_day_summary(namespace: str) -> dict | None:
     """Cross-surface 24h summary from Error Reporting for the daily digest.
 
     The digest's run-table sweep only sees Dagster; ER sees every bridged
-    surface (adam-api, cutout workers, shards). Fail-open: None on any error
-    and the digest renders without this section.
+    surface (adam-api, cutout workers, shards). Counts come from
+    service-filtered queries so a group spanning environments contributes
+    only this environment's occurrences. Fail-open: None on any error and
+    the digest renders an explicit "unavailable" line.
     """
     try:
-        stats = _er_get(
-            "groupStats", {"timeRange.period": "PERIOD_1_DAY", "pageSize": 100}
-        ).get("errorGroupStats", [])
         prefix = f"{namespace}/"
-        now = datetime.datetime.now(datetime.timezone.utc)
-        groups, new_today, top = 0, 0, []
+        stats, complete = _fetch_group_stats_pages("PERIOD_1_DAY")
+        services: set[str] = set()
         for g in stats:
-            services = {
-                s.get("service", "") for s in g.get("affectedServices", []) if s.get("service")
-            }
-            mine = sorted(s for s in services if s.startswith(prefix))
-            if not mine:
-                continue
-            groups += 1
-            first = g.get("firstSeenTime", "")
-            try:
-                first_dt = datetime.datetime.fromisoformat(first.replace("Z", "+00:00"))
-                if (now - first_dt).total_seconds() < 24 * 3600:
-                    new_today += 1
-            except (ValueError, TypeError):
-                pass
-            headline = (g.get("representative", {}).get("message") or "").splitlines()
-            top.append(
-                (
-                    int(g.get("count", "1")),
-                    (headline[0].rstrip(":") if headline else "error")[:120],
-                    mine[0].split("/", 1)[-1],
-                    g.get("group", {}).get("groupId", ""),
-                )
+            for s in g.get("affectedServices", []):
+                name = s.get("service", "")
+                if name.startswith(prefix):
+                    services.add(name)
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        rows: dict[str, tuple[int, str, str, str]] = {}
+        new_today: set[str] = set()
+        for service in sorted(services):
+            svc_stats, svc_complete = _fetch_group_stats_pages(
+                "PERIOD_1_DAY", {"serviceFilter.service": service}
             )
-        top.sort(key=lambda t: -t[0])
-        return {"groups": groups, "new_today": new_today, "top": top[:3], "project": _PROJECT}
+            complete = complete and svc_complete
+            for g in svc_stats:
+                group_id = g.get("group", {}).get("groupId", "")
+                if not group_id:
+                    continue
+                count = int(g.get("count", "1"))
+                first = g.get("firstSeenTime", "")
+                try:
+                    first_dt = datetime.datetime.fromisoformat(first.replace("Z", "+00:00"))
+                    if (now - first_dt).total_seconds() < 24 * 3600:
+                        new_today.add(group_id)
+                except (ValueError, TypeError):
+                    pass
+                headline = (g.get("representative", {}).get("message") or "").splitlines()
+                row = (
+                    count,
+                    (headline[0].rstrip(":") if headline else "error")[:120],
+                    service.split("/", 1)[-1],
+                    group_id,
+                )
+                # A group seen via two services keeps its larger per-service
+                # count for ranking; totals count distinct groups once.
+                if group_id not in rows or count > rows[group_id][0]:
+                    rows[group_id] = row
+
+        top = sorted(rows.values(), key=lambda t: -t[0])
+        return {
+            "groups": len(rows),
+            "new_today": len(new_today),
+            "top": top[:3],
+            "project": _PROJECT,
+            "complete": complete,
+        }
     except Exception:
         return None
 
@@ -181,14 +225,22 @@ def _relative(first_seen_iso: str) -> str:
         return first_seen_iso[:19]
 
 
-def render_group_blocks(group_stat: dict, event: dict, namespace: str) -> tuple[str, list]:
+def render_group_blocks(
+    group_stat: dict, event: dict, namespace: str, service: str = ""
+) -> tuple[str, list]:
     parsed = parse_reported_message(event.get("message", ""))
     group_id = group_stat.get("group", {}).get("groupId", "")
     count = group_stat.get("count", "1")
-    services = {
-        s.get("service", "") for s in group_stat.get("affectedServices", []) if s.get("service")
-    }
-    location = next(iter(services), "").split("/", 1)[-1] or "dagster"
+    # The caller passes the in-scope service it sampled from; an arbitrary
+    # member of the affected-services set could belong to another namespace.
+    if not service:
+        services = {
+            s.get("service", "")
+            for s in group_stat.get("affectedServices", [])
+            if s.get("service")
+        }
+        service = next(iter(sorted(services)), "")
+    location = service.split("/", 1)[-1] or "dagster"
     prefix = "" if namespace == "production" else f"[dev · {namespace}] "
 
     critical = parsed["meta"].get("severity", "").lower() == "critical"
@@ -272,55 +324,115 @@ def render_group_blocks(group_stat: dict, event: dict, namespace: str) -> tuple[
     default_status=_enabled_status(),
 )
 def alerting_er_group_renderer(context: SensorEvaluationContext):
-    """Announce Error Reporting groups this environment hasn't announced."""
+    """Announce Error Reporting groups this environment hasn't announced.
+
+    Cursor contract (each rule exists because its absence was a measured or
+    review-demonstrated loss):
+    - ``initialized`` is set only after one COMPLETE successful discovery,
+      empty results included — ``not announced`` is NOT initialization, or an
+      empty production project would adopt (and silently swallow) its first
+      real error.
+    - A group id enters ``announced`` only after Slack accepted the post;
+      until then it stays in ``pending`` and is retried on later ticks, so a
+      Slack or ER blip cannot permanently erase an announcement.
+    - Deliveries per tick are budgeted; overflow stays pending.
+    """
     namespace = current_namespace()
     try:
         state = json.loads(context.cursor) if context.cursor else {}
     except (ValueError, TypeError):
         state = {}
     announced = state.setdefault("announced", {})
+    pending = state.setdefault("pending", {})
+    # Legacy cursors predate the flag; a non-empty announced set means the
+    # original first-sync adoption already happened.
+    if "initialized" not in state:
+        state["initialized"] = bool(announced)
     now = datetime.datetime.now(datetime.timezone.utc).timestamp()
 
     try:
-        stats = _er_get(
-            "groupStats",
-            {"timeRange.period": "PERIOD_1_WEEK", "pageSize": 100},
-        ).get("errorGroupStats", [])
+        stats, complete = _fetch_group_stats_pages("PERIOD_1_WEEK")
     except Exception as exc:
         context.log.warning(f"alerting renderer: groupStats fetch failed ({exc})")
         return
 
     scope_prefix = f"{namespace}/"
-    first_sync = not announced
+    in_scope: dict[str, tuple[dict, str]] = {}
     for g in stats:
         services = {
             s.get("service", "")
             for s in g.get("affectedServices", [])
             if s.get("service")
         }
-        if not any(s.startswith(scope_prefix) for s in services):
-            continue
+        mine = sorted(s for s in services if s.startswith(scope_prefix))
         group_id = g.get("group", {}).get("groupId", "")
-        if not group_id or group_id in announced:
+        if mine and group_id:
+            in_scope[group_id] = (g, mine[0])
+
+    if not state["initialized"]:
+        if complete:
+            # Adoption snapshot: everything that exists now is old news.
+            for group_id in in_scope:
+                announced.setdefault(group_id, now)
+            state["initialized"] = True
+            context.log.info(
+                f"alerting renderer: initialized; adopted {len(in_scope)} existing groups"
+            )
+        else:
+            context.log.warning(
+                "alerting renderer: discovery incomplete (page cap); "
+                "initialization deferred"
+            )
+        context.update_cursor(json.dumps(state))
+        return
+
+    for group_id in in_scope:
+        if group_id not in announced:
+            pending.setdefault(group_id, now)
+    # Groups that aged out of the discovery window can never be rendered
+    # again; drop them only when the scan was complete.
+    if complete:
+        for group_id in [gid for gid in pending if gid not in in_scope]:
+            del pending[group_id]
+
+    delivered = 0
+    for group_id in sorted(pending, key=pending.get):
+        if delivered >= _POST_BUDGET_PER_TICK:
+            context.log.info(
+                f"alerting renderer: post budget reached; {len(pending)} still pending"
+            )
+            break
+        if group_id not in in_scope:
             continue
-        announced[group_id] = now
-        if first_sync:
-            # Adoption run: mark every pre-existing group as known without
-            # posting, so enabling the renderer never floods the channel.
-            continue
+        g, service = in_scope[group_id]
+        delivered += 1
         try:
             events = _er_get(
                 "events",
-                {"groupId": group_id, "pageSize": 1, "timeRange.period": "PERIOD_1_WEEK"},
+                {
+                    "groupId": group_id,
+                    "pageSize": 1,
+                    "timeRange.period": "PERIOD_1_WEEK",
+                    # Sample from THIS environment's service: groups are
+                    # content-keyed and can span namespaces, and a
+                    # production card must never carry a preview traceback.
+                    "serviceFilter.service": service,
+                },
             ).get("errorEvents", [])
             event = events[0] if events else {}
-            fallback, blocks = render_group_blocks(g, event, namespace)
-            posted = post_message(context.log, fallback, blocks)
-            context.log.info(
-                f"alerting renderer: announced group {group_id} posted={posted}"
-            )
+            fallback, blocks = render_group_blocks(g, event, namespace, service=service)
+            if post_message(context.log, fallback, blocks):
+                announced[group_id] = now
+                del pending[group_id]
+                context.log.info(f"alerting renderer: announced group {group_id} posted=True")
+            else:
+                context.log.warning(
+                    f"alerting renderer: delivery failed for group {group_id}; kept pending"
+                )
         except Exception as exc:
-            context.log.warning(f"alerting renderer: group {group_id} failed ({exc})")
+            context.log.warning(
+                f"alerting renderer: group {group_id} failed ({exc}); kept pending"
+            )
 
     if len(announced) > _ANNOUNCED_CAP:
         for gid in sorted(announced, key=announced.get)[: len(announced) - _ANNOUNCED_CAP]:

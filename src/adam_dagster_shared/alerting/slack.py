@@ -25,31 +25,13 @@ from typing import Any
 
 import requests
 
-from .classify import Tier, Verdict, origin_label
 
 DEFAULT_CHANNEL = "C05KNK4KZFA"  # #engineering-gcp-alerts
 
 
-def current_namespace() -> str:
-    """Same resolution order as dag.utils.get_current_namespace, duplicated
-    here so the alerting package stays importable with only dagster+requests
-    (dag.utils pulls astropy/kubernetes/google-cloud-container)."""
-    for env_var in ("GARDEN_NAMESPACE", "K8S_NAMESPACE", "KUBERNETES_NAMESPACE"):
-        value = os.environ.get(env_var)
-        if value and value.strip():
-            return value.strip()
-    try:
-        with open("/var/run/secrets/kubernetes.io/serviceaccount/namespace") as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        return "nonamespace"
-
-_TIER_EMOJI = {
-    Tier.PAGE: "🔴",
-    Tier.NOTIFY: "🟡",
-    Tier.DIGEST: "📋",
-    Tier.USER_FACING: "🔭",
-}
+# One namespace resolution for the whole package (env, serviceaccount file,
+# "local") — three drifting fallbacks was a measured review finding.
+from adam_dagster_shared.er_logging import current_namespace  # noqa: E402,F401
 
 _token_cache: dict[str, tuple[str, float]] = {}
 _TOKEN_TTL_SECONDS = 15 * 60
@@ -153,58 +135,6 @@ def _section(text: str) -> dict[str, Any]:
     return {"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}}
 
 
-def alert_blocks(
-    verdict: Verdict,
-    *,
-    job_name: str,
-    run_id: str,
-    tags: dict[str, str],
-    namespace: str,
-    occurrences_24h: int,
-    first_seen_ts: float | None,
-    escalated: bool,
-    webserver_url: str | None = None,
-) -> tuple[str, list[dict[str, Any]]]:
-    """Render one PAGE/NOTIFY alert. Returns (fallback_text, blocks)."""
-    tier = Tier.PAGE if escalated else verdict.tier
-    emoji = _TIER_EMOJI[tier]
-    prefix = env_prefix(namespace)
-    origin = origin_label(tags)
-
-    headline = (
-        f"{emoji} *{prefix}{tier.value}* — {verdict.klass}"
-        + (" (escalated: signature clustering)" if escalated else "")
-    )
-    where = f"*{job_name}*" + (f" · step `{verdict.step_key}`" if verdict.step_key else "")
-
-    lines = [headline, where, verdict.reason]
-    if verdict.exception:
-        lines.append(f"```{verdict.exception[:600]}```")
-
-    detail_bits = [f"origin: {origin}", f"signature `{verdict.signature}`"]
-    if occurrences_24h > 1:
-        detail_bits.append(f"*{occurrences_24h} occurrences in 24h*")
-    if first_seen_ts is not None:
-        age_h = max(0.0, (time.time() - first_seen_ts) / 3600.0)
-        detail_bits.append(f"first seen {age_h:.1f}h ago")
-    partition = tags.get("dagster/partition")
-    if partition:
-        detail_bits.append(f"partition `{partition}`")
-    backfill = tags.get("dagster/backfill")
-    if backfill:
-        detail_bits.append(f"backfill `{backfill}`")
-
-    blocks = [_section("\n".join(lines)), _ctx_block(" · ".join(detail_bits))]
-    blocks.append(_ctx_block(f"run `{run_id[:8]}`"))
-    if webserver_url:
-        blocks.append(
-            actions_block([link_button("Open run in Dagster", f"{webserver_url}/runs/{run_id}")])
-        )
-
-    fallback = f"{tier.value} {verdict.klass}: {job_name} ({verdict.reason})"
-    return fallback, blocks
-
-
 def link_button(label: str, url: str) -> dict[str, Any]:
     """Block Kit URL button.
 
@@ -228,10 +158,8 @@ def digest_blocks(summary: dict[str, Any], namespace: str) -> tuple[str, list[di
     """Render the daily digest from a plain summary dict (see digest.py)."""
     prefix = env_prefix(namespace)
     total = summary["total_failures"]
-    baseline = summary.get("baseline_median_per_day")
     head = f"📋 *{prefix}Daily error digest — {summary['date_label']}*"
-    vs = f" vs trailing median {baseline}/day" if baseline is not None else ""
-    lines = [head, f"*Failures: {total}*{vs} · canceled: {summary['canceled']}"]
+    lines = [head, f"*Failures: {total}* · canceled: {summary['canceled']}"]
 
     if summary["by_class"]:
         class_bits = [f"{klass} {count}" for klass, count in summary["by_class"]]
@@ -254,11 +182,18 @@ def digest_blocks(summary: dict[str, Any], namespace: str) -> tuple[str, list[di
     # workers, shards — everything bridged; the sweep above is Dagster-only).
     er = summary.get("er")
     buttons = []
-    if er:
+    if not er:
+        # An unavailable cross-surface view must be visible, not silently
+        # absent — a digest that quietly narrows to Dagster-only misleads.
+        blocks.append(
+            _section("*Across all services (Error Reporting):* unavailable this run")
+        )
+    else:
+        maybe = "" if er.get("complete", True) else " (scan capped; counts are a lower bound)"
         er_lines = [
             f"*Across all services (Error Reporting):* "
             f"{er['groups']} active error group{'s' if er['groups'] != 1 else ''} in 24h · "
-            f"{er['new_today']} new"
+            f"{er['new_today']} new{maybe}"
         ]
         for count, headline, service, group_id in er.get("top", []):
             er_lines.append(f"• ×{count} — `{headline}` ({service})")

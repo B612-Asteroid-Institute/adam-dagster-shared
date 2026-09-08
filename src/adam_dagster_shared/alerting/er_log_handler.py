@@ -42,7 +42,6 @@ import os
 import re
 import sys
 
-_NAMESPACE_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 _REPORTED_ERROR_TYPE = (
     "type.googleapis.com/google.devtools.clouderrorreporting.v1beta1.ReportedErrorEvent"
 )
@@ -55,20 +54,15 @@ _PREFIX = re.compile(
 
 
 def _service_context() -> dict:
-    namespace = os.environ.get("GARDEN_NAMESPACE", "").strip()
-    if not namespace:
-        try:
-            with open(_NAMESPACE_PATH) as f:
-                namespace = f.read().strip()
-        except OSError:
-            namespace = "unknown"
+    from adam_dagster_shared.er_logging import current_namespace
+
     location = os.environ.get("DAGSTER_LOCATION_NAME", "").strip() or "dagster"
     version = (
         os.environ.get("DAGSTER_IMAGE_VERSION", "").strip()
         or os.environ.get("GARDEN_ACTION_VERSION", "").strip()
         or "unknown"
     )
-    return {"service": f"{namespace}/{location}", "version": version}
+    return {"service": f"{current_namespace()}/{location}", "version": version}
 
 
 def _innermost_cls(error) -> str:
@@ -124,7 +118,16 @@ class ErrorReportingHandler(logging.Handler):
             if record.exc_info and record.exc_info[0] is not None:
                 import traceback
 
-                message = message + "\n" + "".join(traceback.format_exception(*record.exc_info))
+                from adam_dagster_shared.er_logging import neutralize_stack
+
+                # Neutralized like every other path: one intact
+                # "Traceback (most recent call last):" header flips ER to
+                # frame-based grouping and merges unrelated errors.
+                message = (
+                    message
+                    + "\n"
+                    + neutralize_stack("".join(traceback.format_exception(*record.exc_info)))
+                )
                 exc_cls = exc_cls or record.exc_info[0].__name__
             # The grouping headline: first 3 tokens carry the exception class.
             step_for_headline = (

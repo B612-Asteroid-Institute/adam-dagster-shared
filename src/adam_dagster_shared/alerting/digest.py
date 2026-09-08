@@ -73,9 +73,6 @@ def build_digest_summary(instance, now: datetime.datetime) -> dict:
             (sig, count, sig_labels.get(sig, ""))
             for sig, count in sig_counts.most_common(_TOP_SIGNATURES)
         ],
-        # Baseline wiring (trailing median) arrives with the BQ signature
-        # registry; omitted rather than guessed until then.
-        "baseline_median_per_day": None,
     }
 
 
@@ -94,6 +91,10 @@ def post_daily_error_digest(context) -> None:
     fallback, blocks = digest_blocks(summary, namespace)
     posted = post_message(context.log, fallback, blocks)
     context.log.info(f"alerting digest: {summary['total_failures']} failures, posted={posted}")
+    if not posted:
+        # A silently swallowed delivery error would make "the digest job
+        # succeeded" a lie; a failed run is visible and retryable.
+        raise RuntimeError("daily digest was not delivered to Slack (see warnings above)")
 
 
 @dg.job(
