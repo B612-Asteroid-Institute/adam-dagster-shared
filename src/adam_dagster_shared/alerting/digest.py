@@ -1,10 +1,10 @@
 """Daily error digest: one message summarizing the last 24h of failures.
 
 The digest re-derives its numbers by sweeping the runs table and classifying
-each failure with the same pure rules the sensor uses — no state handoff, so
-a sensor outage cannot corrupt the digest and vice versa. DIGEST- and
-USER_FACING-tier events (which never post individually) get their airtime
-here.
+each failure with the same pure rules the audit sensor uses — no state
+handoff, so a sensor outage cannot corrupt the digest and vice versa. This is
+where infrastructure noise and users' own failures get their airtime;
+individual error classes are Error Reporting's (and the renderer's) job.
 """
 
 from __future__ import annotations
@@ -15,11 +15,10 @@ from collections import Counter
 import dagster as dg
 from dagster import DagsterRunStatus, RunsFilter
 
-from .slack import current_namespace  # self-contained namespace lookup
-from .classify import Tier, classify
+from .classify import classify
 from .extract import extract_failure_context
 from .sensors import _enabled_status
-from .slack import digest_blocks, post_message
+from .slack import current_namespace, digest_blocks, post_message
 
 _SWEEP_LIMIT = 1000  # > 5x the worst measured day (194 failures)
 _TOP_SIGNATURES = 5
@@ -54,9 +53,9 @@ def build_digest_summary(instance, now: datetime.datetime) -> dict:
         sig_counts[verdict.signature] += 1
         sig_labels.setdefault(
             verdict.signature,
-            f"{ctx.job_name}: {verdict.exception or verdict.reason}",
+            f"{ctx.job_name}: {verdict.exception or verdict.klass}",
         )
-        if verdict.tier is Tier.USER_FACING:
+        if verdict.user_facing:
             user_failures += 1
             user = ctx.tags.get("external-user")
             if user:

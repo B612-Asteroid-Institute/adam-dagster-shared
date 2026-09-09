@@ -4,23 +4,18 @@ The rule set is seeded from the 2026-07-29..08-28 production measurement
 (1,225 FAILURE runs; see cloud_errors_2/INVENTORY_2026-08-28.md): every rule
 below matched a real observed signature class. Rules are pure functions over
 already-extracted data so they unit-test against captured payloads without a
-Dagster instance. Anything unmatched fails open to NOTIFY/unknown — the
-classifier must never be the reason an alert goes missing.
+Dagster instance. Anything unmatched fails open to "unknown" — the classifier
+must never be the reason a failure goes uncounted.
+
+Verdicts feed the daily digest (per-class counts, top signatures, user-run
+count) and the audit log. Individual Slack posting is Error Reporting's job.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 
 from .signatures import fingerprint
-
-
-class Tier(Enum):
-    PAGE = "PAGE"
-    NOTIFY = "NOTIFY"
-    DIGEST = "DIGEST"
-    USER_FACING = "USER_FACING"
 
 
 @dataclass
@@ -52,26 +47,13 @@ class FailureContext:
 
 @dataclass
 class Verdict:
-    tier: Tier
     klass: str  # short kebab-case class label
-    reason: str  # one-line human explanation
-    signature: str  # fingerprint for cooldown/dedup/recurrence
+    signature: str  # fingerprint grouping runs of one failure class
+    # An external user's own run: counted separately in the digest (adam-api's
+    # per-job Slack path owns the user-visible message).
+    user_facing: bool = False
     step_key: str | None = None
     exception: str | None = None  # "Cls: first message line" for display
-
-
-def _origin(tags: dict[str, str]) -> str:
-    if "external-user" in tags:
-        return "user-api"
-    if "dagster/backfill" in tags:
-        return "backfill"
-    if tags.get("dagster/auto_materialize") or tags.get("dagster/from_automation_condition"):
-        return "automation"
-    if "dagster/schedule_name" in tags:
-        return "schedule"
-    if "dagster/sensor_name" in tags:
-        return "sensor"
-    return "manual"
 
 
 # Retry wrappers carry no identity of their own; classification looks through
@@ -99,22 +81,18 @@ def _display(cls: str | None, msg: str) -> str:
 
 
 def classify(ctx: FailureContext) -> Verdict:
-    origin = _origin(ctx.tags)
     all_msgs = " | ".join(
         m for sf in ctx.step_failures for m in sf.msg_chain
     ).lower()
 
-    # Rule: the user's own failure. Routed to the digest count (adam-api's
-    # existing per-job Slack path owns the user-visible message); never posted
-    # to the infra channel individually.
-    if origin == "user-api":
+    # Rule: the user's own failure, whatever the cause.
+    if "external-user" in ctx.tags:
         sf = ctx.step_failures[0] if ctx.step_failures else None
         cls, msg = _real_exception(sf) if sf else (None, "")
         return Verdict(
-            tier=Tier.USER_FACING,
             klass="user-job-failure",
-            reason=f"external-user run failed ({ctx.tags.get('external-user', '?')})",
             signature=fingerprint(ctx.job_name, sf.step_key if sf else None, cls, msg),
+            user_facing=True,
             step_key=sf.step_key if sf else None,
             exception=_display(cls, msg),
         )
@@ -125,17 +103,15 @@ def classify(ctx: FailureContext) -> Verdict:
                 return sf
         return None
 
-    # Rule: system OOM (user OOM is caught by the user-api rule above).
-    # Checked BEFORE the generic k8s-death markers: an OOM-killed pod also
-    # matches the broad failed-job phrases, and the most severe specific
-    # evidence must win over a generic fallback (review finding R12).
+    # Rule: system OOM (rare by design: requests-only, ~2x headroom). Checked
+    # BEFORE the generic k8s-death markers: an OOM-killed pod also matches the
+    # broad failed-job phrases, and the specific evidence must win over the
+    # generic fallback (review finding R12).
     if any(marker in all_msgs for marker in _OOM_MARKERS):
         sf = _step_matching(_OOM_MARKERS) or (ctx.step_failures[0] if ctx.step_failures else None)
         cls, msg = _real_exception(sf) if sf else (None, "oom")
         return Verdict(
-            tier=Tier.PAGE,
             klass="system-oom",
-            reason="OOM kill on a system workload (rare by design: requests-only, ~2x headroom)",
             signature=fingerprint(ctx.job_name, sf.step_key if sf else None, "OOM", msg),
             step_key=sf.step_key if sf else None,
             exception=_display(cls, msg),
@@ -143,14 +119,11 @@ def classify(ctx: FailureContext) -> Verdict:
 
     # Rule: k8s job death (eviction / node reclaim / preemption — the phrase
     # alone does not establish which). No exception chain exists — the pod is
-    # simply gone. Self-heals via retry policies and automation re-requests;
-    # digest-tier unless rates spike (rate excursions are the digest's job).
+    # simply gone. Self-heals via retry policies and automation re-requests.
     if any(marker in all_msgs for marker in _K8S_DEATH_MARKERS):
         sf = _step_matching(_K8S_DEATH_MARKERS) or ctx.step_failures[0]
         return Verdict(
-            tier=Tier.DIGEST,
             klass="k8s-job-death",
-            reason="step pod died (eviction/reclaim/preemption), retries exhausted",
             signature=fingerprint(ctx.job_name, sf.step_key, "K8sJobDeath", ""),
             step_key=sf.step_key,
             exception=_display(None, sf.innermost_msg),
@@ -161,40 +134,32 @@ def classify(ctx: FailureContext) -> Verdict:
     if any("DagsterExecutionInterruptedError" in sf.cls_chain for sf in ctx.step_failures):
         sf = next(s for s in ctx.step_failures if "DagsterExecutionInterruptedError" in s.cls_chain)
         return Verdict(
-            tier=Tier.DIGEST,
             klass="interrupted",
-            reason="step interrupted (eviction/termination)",
             signature=fingerprint(ctx.job_name, sf.step_key, "Interrupted", ""),
             step_key=sf.step_key,
             exception=_display(*_real_exception(sf)),
         )
 
     # Rule: deliberate data-quality gates. `dagster.Failure` raised on purpose
-    # (e.g. "Unified AIMS+MPC reconciliation mismatch detected") — these are
-    # designed alarms and today surface nowhere.
+    # (e.g. "Unified AIMS+MPC reconciliation mismatch detected") — designed
+    # alarms, counted as their own class.
     for sf in ctx.step_failures:
         cls, msg = _real_exception(sf)
         if cls == "Failure":
             return Verdict(
-                tier=Tier.NOTIFY,
                 klass="quality-gate",
-                reason="a deliberate data-quality gate fired",
                 signature=fingerprint(ctx.job_name, sf.step_key, cls, msg),
                 step_key=sf.step_key,
                 exception=_display(cls, msg),
             )
 
     # Rule: real code/data exception (610/1225 measured, mostly wrapped in
-    # RetryRequestedFromPolicy after exhausting the 3x policy). NOTIFY on a
-    # new signature; the sensor escalates to PAGE when one signature clusters.
+    # RetryRequestedFromPolicy after exhausting the 3x policy).
     if ctx.step_failures:
         sf = ctx.step_failures[0]
         cls, msg = _real_exception(sf)
         return Verdict(
-            tier=Tier.NOTIFY,
             klass="code-error",
-            reason="step raised and exhausted retries" if set(sf.cls_chain) & _RETRY_WRAPPERS
-            else "step raised",
             signature=fingerprint(ctx.job_name, sf.step_key, cls, msg),
             step_key=sf.step_key,
             exception=_display(cls, msg),
@@ -205,31 +170,12 @@ def classify(ctx: FailureContext) -> Verdict:
     if ctx.run_failure is not None:
         cls, msg = ctx.run_failure
         blob = f"{cls or ''} {msg}".lower()
-        if any(marker in blob for marker in _CRASH_RESUME_MARKERS):
-            return Verdict(
-                tier=Tier.DIGEST,
-                klass="run-worker-crash",
-                reason="run worker crash/resume artifact",
-                signature=fingerprint(ctx.job_name, None, cls, msg),
-                exception=_display(cls, msg),
-            )
+        klass = "run-worker-crash" if any(m in blob for m in _CRASH_RESUME_MARKERS) else "run-failure"
         return Verdict(
-            tier=Tier.NOTIFY,
-            klass="run-failure",
-            reason="run failed without a step failure",
+            klass=klass,
             signature=fingerprint(ctx.job_name, None, cls, msg),
             exception=_display(cls, msg),
         )
 
     # Fail open: no events captured at all. Never drop it silently.
-    return Verdict(
-        tier=Tier.NOTIFY,
-        klass="unknown",
-        reason="no failure events could be extracted (fail-open)",
-        signature=fingerprint(ctx.job_name, None, None, ""),
-    )
-
-
-def origin_label(tags: dict[str, str]) -> str:
-    """Public accessor used by message rendering and the digest."""
-    return _origin(tags)
+    return Verdict(klass="unknown", signature=fingerprint(ctx.job_name, None, None, ""))

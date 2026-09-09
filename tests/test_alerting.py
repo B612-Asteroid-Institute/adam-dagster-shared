@@ -17,7 +17,7 @@ import pytest
 
 from adam_dagster_shared.alerting import sensors as sensors_mod
 from adam_dagster_shared.alerting import slack as slack_mod
-from adam_dagster_shared.alerting.classify import FailureContext, StepFailure, Tier, classify
+from adam_dagster_shared.alerting.classify import FailureContext, StepFailure, classify
 from adam_dagster_shared.alerting.er_log_handler import ErrorReportingHandler
 from adam_dagster_shared.alerting.renderer import parse_reported_message, render_group_blocks
 from adam_dagster_shared.alerting.signatures import fingerprint
@@ -81,13 +81,13 @@ def test_fingerprint_ignores_varying_tokens_but_not_step():
 
 
 @pytest.mark.parametrize(
-    "ctx,klass,tier,exception_contains",
+    "ctx,klass,user_facing,exception_contains",
     [
-        # k8s job death: digest-only infrastructure noise.
+        # k8s job death: infrastructure noise, counted as its own class.
         (
             _ctx(tags={"dagster/backfill": "abc"},
                  step_failures=[StepFailure("aims_observation_index_shards", [""], [K8S_DEATH_MSG])]),
-            "k8s-job-death", Tier.DIGEST, None,
+            "k8s-job-death", False, None,
         ),
         # Retry wrapper unwrapped to the real exception.
         (
@@ -97,29 +97,29 @@ def test_fingerprint_ignores_varying_tokens_but_not_step():
                      ["RetryRequestedFromPolicy", "RuntimeError"],
                      ["Exceeded max_retries of 0", DUPLICATE_GATE_MSG],
                  )]),
-            "code-error", Tier.NOTIFY, "duplicate gate",
+            "code-error", False, "duplicate gate",
         ),
         (
             _ctx(tags={"dagster/schedule_name": "recon"},
                  step_failures=[StepFailure("reconcile", ["Failure"], [RECONCILIATION_MSG])],
                  job="unified_aims_mpc_reconciliation_daily_job"),
-            "quality-gate", Tier.NOTIFY, None,
+            "quality-gate", False, None,
         ),
-        (_ctx(run_failure=("CheckError", CRASH_RESUME_MSG)), "run-worker-crash", Tier.DIGEST, None),
+        (_ctx(run_failure=("CheckError", CRASH_RESUME_MSG)), "run-worker-crash", False, None),
         # Review R12: the OOM marker wins over the generic k8s-death marker.
         (_ctx(step_failures=[StepFailure("system", ["RuntimeError"], [OOM_MSG])]),
-         "system-oom", Tier.PAGE, None),
+         "system-oom", False, None),
         # External-user runs are the user's problem, whatever the failure.
         (_ctx(tags={"external-user": "u@e.org"}, step_failures=[StepFailure("s", ["Exception"], [OOM_MSG])]),
-         "user-job-failure", Tier.USER_FACING, None),
+         "user-job-failure", True, None),
         # Empty context fails open rather than raising.
-        (_ctx(), "unknown", Tier.NOTIFY, None),
+        (_ctx(), "unknown", False, None),
     ],
     ids=["k8s-death", "retry-unwrap", "quality-gate", "crash-resume", "oom-precedence", "external-user", "empty"],
 )
-def test_classify_captured_production_failures(ctx, klass, tier, exception_contains):
+def test_classify_captured_production_failures(ctx, klass, user_facing, exception_contains):
     v = classify(ctx)
-    assert (v.klass, v.tier) == (klass, tier)
+    assert (v.klass, v.user_facing) == (klass, user_facing)
     if exception_contains:
         assert v.exception and "RuntimeError" in v.exception and exception_contains in v.exception
 

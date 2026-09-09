@@ -76,8 +76,10 @@ to both grouping modes. Treat these formats as a tested protocol: the renderer p
 - Kill switch for posting: revoke the bot token (or unset the token secret env). The
   digest run FAILS on undelivered posts (visible, retryable) rather than succeeding
   silently.
-- The failure classifier logs one `ALERTING_VERDICT` JSON line per failed run (audit +
-  digest input). Its former cooldown/breaker posting engine was removed 2026-09-08.
+- The `alerting_failure_reporter` sensor logs one `ALERTING_VERDICT` JSON line per failed
+  run (class, `user_facing`, signature) as an audit trail while ER and the legacy metric
+  alert run side by side. It never posts, and the digest re-derives its own counts from the
+  runs table, so the sensor can be deleted once the dual-run period ends.
 
 Rollout/validation history: `cloud_errors_2/WORKLOG.md` in the operator's workspace; the
 review that shaped the delivery semantics: 2026-09-08 independent review (R1–R12).

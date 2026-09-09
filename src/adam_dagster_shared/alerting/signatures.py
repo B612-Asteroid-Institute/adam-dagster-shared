@@ -2,7 +2,7 @@
 
 A fingerprint identifies a *class* of failure across runs: the same broken
 code path hit by different partitions, run ids, or row counts must map to one
-fingerprint, or cooldowns and recurrence detection degrade into per-run spam.
+fingerprint, or the digest's top-signature ranking degrades into a per-run list.
 Normalization therefore strips every token observed to vary between runs of
 the same failure in the 2026-07-29..08-28 measurement set (dates, partition
 keys, counts, ids, k8s job hashes) before hashing.

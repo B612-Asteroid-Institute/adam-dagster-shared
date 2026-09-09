@@ -1,10 +1,11 @@
-"""Severity-tiered error reporting to Slack.
+"""Error reporting to Slack, with Google Error Reporting as the system of record.
 
-Classifies every failed run against a measured taxonomy (rules first; every
-unmatched shape fails open to NOTIFY), applies per-signature cooldowns and a
-posting circuit breaker, and rolls expected failure classes into a daily
-digest. Design and measurements: cloud_errors_2/PROPOSAL_ERROR_REPORTING and
-IMPLEMENTATION_PLAN (2026-08-28).
+Every surface emits structured error entries (er_log_handler for Dagster,
+er_logging for services and workers); Error Reporting groups and counts them;
+the renderer sensor posts one rich Slack card per NEW group. A daily digest
+classifies the day's Dagster failures against a measured taxonomy (every
+unmatched shape fails open to "unknown") and adds a cross-surface ER summary;
+a watchdog flags hung runs. See docs/ALERTING.md.
 
 Everything is gated on ALERTING_ENABLED and runs in dry-run (payloads logged,
 nothing posted) until ALERTING_SLACK_TOKEN_SECRET is configured.

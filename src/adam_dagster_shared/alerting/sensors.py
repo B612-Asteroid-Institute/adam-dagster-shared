@@ -4,9 +4,7 @@ The failure reporter classifies every newly failed run against the measured
 taxonomy and logs one ALERTING_VERDICT JSON line per run — an audit trail and
 the classifier's live regression feed. It never posts: channel ownership
 belongs to the Error Reporting group renderer, and the digest re-derives its
-numbers independently. (The original cooldown/breaker/escalation posting
-engine was removed 2026-09-08 — dormant safeguards that the active path
-bypassed were worse than no safeguards.)
+numbers independently.
 
 The watchdog flags runs stuck in STARTED far beyond their job's historical
 p95 duration. Detection and verdict logging are unconditional; Slack posting
@@ -128,8 +126,8 @@ def alerting_failure_reporter(context: SensorEvaluationContext):
                     {
                         "run_id": run.run_id,
                         "job": ctx.job_name,
-                        "tier": verdict.tier.value,
                         "class": verdict.klass,
+                        "user_facing": verdict.user_facing,
                         "signature": verdict.signature,
                         "step": verdict.step_key,
                         "exception": (verdict.exception or "")[:300],
@@ -258,8 +256,8 @@ def alerting_hung_run_watchdog(context: SensorEvaluationContext):
             p95_min = (baseline["p95"] or 0) / 60
             user = (run.tags or {}).get("external-user")
             text = (
-                f"🟡 *{'' if namespace == 'production' else f'[dev · {namespace}] '}NOTIFY* — "
-                f"run stuck: *{job}* run `{run.run_id[:8]}` STARTED "
+                f"🟡 *{'' if namespace == 'production' else f'[dev · {namespace}] '}Hung run* — "
+                f"*{job}* run `{run.run_id[:8]}` STARTED "
                 f"{age / 3600:.1f}h ago"
                 + (f"; p95 for this job is {p95_min:.0f}m" if baseline["p95"] else
                    " (no duration history; 6h floor exceeded)")
