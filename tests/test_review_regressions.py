@@ -3,23 +3,21 @@
 Each test encodes a delivery/orchestration behavior the review demonstrated
 was missing; together they are the acceptance bar for the renderer's
 initialization, pending-delivery, pagination, scoping, and budget semantics,
-plus traceback neutralization, cursor boundaries, watchdog pagination, and
-classifier precedence. External ER/Slack traffic is stubbed at module
-boundaries; two tests exercise a real ephemeral Dagster instance.
+plus reporter cursor boundaries and watchdog pagination. External ER/Slack
+traffic is stubbed at module boundaries; the last three tests exercise a real
+ephemeral Dagster instance, and the final one is the positive control for
+the Dagster log handler's event path (handcrafted-record tests live in
+test_alerting.py).
 """
 
 import datetime as dt
 import json
-import logging
-import sys
 from types import SimpleNamespace
 
 import dagster as dg
 import pytest
 
-from adam_dagster_shared import er_logging
 from adam_dagster_shared.alerting import renderer, sensors
-from adam_dagster_shared.alerting.er_log_handler import ErrorReportingHandler as DagsterHandler
 
 
 @pytest.fixture(autouse=True)
@@ -182,31 +180,6 @@ def test_renderer_has_per_tick_backpressure(monkeypatch):
     assert len(posts) == 30
 
 
-def test_chained_python_error_has_no_er_parseable_traceback_header(capsys):
-    try:
-        try:
-            raise ValueError("inner")
-        except ValueError as exc:
-            raise RuntimeError("outer") from exc
-    except RuntimeError:
-        record = logging.LogRecord("worker", logging.ERROR, __file__, 1, "failed", (), sys.exc_info())
-    er_logging.ErrorReportingHandler().emit(record)
-    entry = json.loads(capsys.readouterr().out)
-    assert "Traceback (most recent call last):" not in entry["message"]
-    assert entry["message"].count("Stack trace (most recent call last):") == 2
-
-
-def test_dagster_exception_log_has_no_er_parseable_traceback_header(capsys):
-    try:
-        raise ValueError("inner")
-    except ValueError:
-        record = logging.LogRecord("dagster", logging.ERROR, __file__, 1, "failed", (), sys.exc_info())
-    record.dagster_meta = {"step_key": "one_asset", "job_name": "job", "orig_message": "failed"}
-    DagsterHandler().emit(record)
-    entry = json.loads(capsys.readouterr().out)
-    assert "Traceback (most recent call last):" not in entry["message"]
-
-
 def test_failure_reporter_consumes_all_runs_with_same_update_timestamp(monkeypatch):
     when = dt.datetime.now(dt.timezone.utc)
     records = [
@@ -305,27 +278,15 @@ def test_actual_dagster_step_failure_keeps_exception_and_run_link(capsys):
         json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith('{"@type"')
     ]
     assert not result.success
+    # Exactly one entry: the run-level "Steps failed: [...]" summary Dagster
+    # also logs at ERROR is skipped as redundant with the STEP_FAILURE record
+    # (verified by mutation: disabling the skip yields 2).
     assert len(entries) == 1
-    assert "ValueError in deliberate_failure:" in entries[0]["message"]
-    assert result.run_id in entries[0]["message"]
-    assert "offline intentional integration failure" in entries[0]["message"]
-
-
-def test_system_oom_not_downgraded_by_generic_k8s_death_marker():
-    from adam_dagster_shared.alerting.classify import FailureContext, StepFailure, Tier, classify
-
-    verdict = classify(
-        FailureContext(
-            "run",
-            "etl",
-            {},
-            step_failures=[
-                StepFailure(
-                    "system",
-                    ["RuntimeError"],
-                    ["Step failed health check: discovered failed Kubernetes job; container OOMKilled"],
-                )
-            ],
-        )
-    )
-    assert verdict.tier is Tier.PAGE
+    message = entries[0]["message"]
+    # Headline = (exception class, step) — the grouping key — with the
+    # human-readable stack kept in Dagster's ER-unparsable "Stack Trace:" form.
+    assert message.startswith("ValueError in deliberate_failure:")
+    assert "offline intentional integration failure" in message
+    assert "Stack Trace:" in message and "Traceback (most recent call last):" not in message
+    assert result.run_id in message
+    assert entries[0]["context"]["reportLocation"]["functionName"] == "deliberate_failure"

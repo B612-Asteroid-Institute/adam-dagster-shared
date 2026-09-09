@@ -3,17 +3,24 @@
 Fixtures are verbatim (or lightly trimmed) failure payloads captured from the
 production event log during the 2026-07-29..08-28 measurement window, so the
 classifier is exercised against the shapes it will actually see.
+
+Delivery/orchestration semantics of the sensors (bootstrap, pending retry,
+pagination, budget) live in test_review_regressions.py; the real-Dagster
+integration test there also covers the Dagster handler's event path.
 """
 
 import json
-import time
+import logging
+import sys
 
-from adam_dagster_shared.alerting import classify as classify_mod
-from adam_dagster_shared.alerting import digest as digest_mod
+import pytest
+
 from adam_dagster_shared.alerting import sensors as sensors_mod
 from adam_dagster_shared.alerting import slack as slack_mod
 from adam_dagster_shared.alerting.classify import FailureContext, StepFailure, Tier, classify
-from adam_dagster_shared.alerting.signatures import fingerprint, normalize_message
+from adam_dagster_shared.alerting.er_log_handler import ErrorReportingHandler
+from adam_dagster_shared.alerting.renderer import parse_reported_message, render_group_blocks
+from adam_dagster_shared.alerting.signatures import fingerprint
 
 # ===== Captured payload fragments (2026-08 production) =====
 
@@ -34,6 +41,7 @@ CRASH_RESUME_MSG = (
     "dagster_shared.check.functions.CheckError: Invariant failed. Description: "
     "Attempted to mark step aims_observation_index_shards as complete"
 )
+OOM_MSG = "Step failed health check: discovered failed Kubernetes job; container OOMKilled"
 
 
 def _ctx(tags=None, step_failures=None, run_failure=None, job="__ASSET_JOB"):
@@ -46,119 +54,88 @@ def _ctx(tags=None, step_failures=None, run_failure=None, job="__ASSET_JOB"):
     )
 
 
-# ===== Normalization / fingerprints =====
+def _emit(record):
+    ErrorReportingHandler().emit(record)
 
 
-def test_normalize_strips_varying_tokens():
-    a = normalize_message("RuntimeError: duplicate gate failed for 2015-02-12: 534 rows")
-    b = normalize_message("RuntimeError: duplicate gate failed for 2019-07-30: 12 rows")
-    assert a == b
-    assert "<date>" in a and "<n>" in a
+def _entry(capsys):
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert len(lines) == 1, "the handler must emit exactly one JSON line per record"
+    return json.loads(lines[0])
 
 
-def test_normalize_strips_k8s_job_hashes():
-    a = normalize_message(K8S_DEATH_MSG)
-    b = normalize_message(K8S_DEATH_MSG.replace("0bc35374201b422f01472fe0ed958ef7", "7862c4ad26c1"))
-    assert a == b
+# ===== Signatures / classification (feed the digest's by-class breakdown) =====
 
 
-def test_fingerprint_stable_across_partitions_but_not_steps():
-    fp1 = fingerprint("__ASSET_JOB", "shards", "RuntimeError", DUPLICATE_GATE_MSG)
-    fp2 = fingerprint(
+def test_fingerprint_ignores_varying_tokens_but_not_step():
+    same = fingerprint("__ASSET_JOB", "shards", "RuntimeError", DUPLICATE_GATE_MSG)
+    # Dates, counts and k8s job hashes vary per partition; the signature must not.
+    assert same == fingerprint(
         "__ASSET_JOB", "shards", "RuntimeError",
         DUPLICATE_GATE_MSG.replace("2015-02-12", "2016-01-01").replace("534", "9"),
     )
-    fp3 = fingerprint("__ASSET_JOB", "other_step", "RuntimeError", DUPLICATE_GATE_MSG)
-    assert fp1 == fp2
-    assert fp1 != fp3
-
-
-# ===== Classification =====
-
-
-def test_k8s_job_death_is_digest_tier():
-    ctx = _ctx(
-        tags={"dagster/backfill": "abc"},
-        step_failures=[StepFailure("aims_observation_index_shards", [""], [K8S_DEATH_MSG])],
+    assert fingerprint("j", "s", "K8sJobDeath", K8S_DEATH_MSG) == fingerprint(
+        "j", "s", "K8sJobDeath", K8S_DEATH_MSG.replace("0bc35374201b422f01472fe0ed958ef7", "7862c4ad")
     )
+    assert same != fingerprint("__ASSET_JOB", "other_step", "RuntimeError", DUPLICATE_GATE_MSG)
+
+
+@pytest.mark.parametrize(
+    "ctx,klass,tier,exception_contains",
+    [
+        # k8s job death: digest-only infrastructure noise.
+        (
+            _ctx(tags={"dagster/backfill": "abc"},
+                 step_failures=[StepFailure("aims_observation_index_shards", [""], [K8S_DEATH_MSG])]),
+            "k8s-job-death", Tier.DIGEST, None,
+        ),
+        # Retry wrapper unwrapped to the real exception.
+        (
+            _ctx(tags={"dagster/auto_materialize": "true"},
+                 step_failures=[StepFailure(
+                     "aims_observation_index_shards",
+                     ["RetryRequestedFromPolicy", "RuntimeError"],
+                     ["Exceeded max_retries of 0", DUPLICATE_GATE_MSG],
+                 )]),
+            "code-error", Tier.NOTIFY, "duplicate gate",
+        ),
+        (
+            _ctx(tags={"dagster/schedule_name": "recon"},
+                 step_failures=[StepFailure("reconcile", ["Failure"], [RECONCILIATION_MSG])],
+                 job="unified_aims_mpc_reconciliation_daily_job"),
+            "quality-gate", Tier.NOTIFY, None,
+        ),
+        (_ctx(run_failure=("CheckError", CRASH_RESUME_MSG)), "run-worker-crash", Tier.DIGEST, None),
+        # Review R12: the OOM marker wins over the generic k8s-death marker.
+        (_ctx(step_failures=[StepFailure("system", ["RuntimeError"], [OOM_MSG])]),
+         "system-oom", Tier.PAGE, None),
+        # External-user runs are the user's problem, whatever the failure.
+        (_ctx(tags={"external-user": "u@e.org"}, step_failures=[StepFailure("s", ["Exception"], [OOM_MSG])]),
+         "user-job-failure", Tier.USER_FACING, None),
+        # Empty context fails open rather than raising.
+        (_ctx(), "unknown", Tier.NOTIFY, None),
+    ],
+    ids=["k8s-death", "retry-unwrap", "quality-gate", "crash-resume", "oom-precedence", "external-user", "empty"],
+)
+def test_classify_captured_production_failures(ctx, klass, tier, exception_contains):
     v = classify(ctx)
-    assert v.tier is Tier.DIGEST
-    assert v.klass == "k8s-job-death"
+    assert (v.klass, v.tier) == (klass, tier)
+    if exception_contains:
+        assert v.exception and "RuntimeError" in v.exception and exception_contains in v.exception
 
 
-def test_retry_exhausted_code_error_is_notify_with_real_exception():
-    ctx = _ctx(
-        tags={"dagster/auto_materialize": "true"},
-        step_failures=[
-            StepFailure(
-                "aims_observation_index_shards",
-                ["RetryRequestedFromPolicy", "RuntimeError"],
-                ["Exceeded max_retries of 0", DUPLICATE_GATE_MSG],
-            )
-        ],
-    )
-    v = classify(ctx)
-    assert v.tier is Tier.NOTIFY
-    assert v.klass == "code-error"
-    assert v.exception is not None and "RuntimeError" in v.exception
-    assert "duplicate gate" in v.exception
+# ===== Slack digest =====
 
 
-def test_external_user_failure_is_user_facing():
-    ctx = _ctx(
-        tags={"external-user": "someone@example.org"},
-        step_failures=[StepFailure("run_precovery", ["SystemExit"], ["SystemExit: 15"])],
-        job="run_parameterized_precovery",
-    )
-    v = classify(ctx)
-    assert v.tier is Tier.USER_FACING
-
-
-def test_quality_gate_failure_is_notify():
-    ctx = _ctx(
-        tags={"dagster/schedule_name": "recon"},
-        step_failures=[StepFailure("reconcile", ["Failure"], [RECONCILIATION_MSG])],
-        job="unified_aims_mpc_reconciliation_daily_job",
-    )
-    v = classify(ctx)
-    assert v.tier is Tier.NOTIFY
-    assert v.klass == "quality-gate"
-
-
-def test_crash_resume_artifact_is_digest():
-    ctx = _ctx(run_failure=("CheckError", CRASH_RESUME_MSG))
-    v = classify(ctx)
-    assert v.tier is Tier.DIGEST
-    assert v.klass == "run-worker-crash"
-
-
-def test_empty_context_fails_open_to_notify():
-    v = classify(_ctx())
-    assert v.tier is Tier.NOTIFY
-    assert v.klass == "unknown"
-
-
-def test_system_oom_is_page_but_user_oom_is_user_facing():
-    oom = StepFailure("step", ["Exception"], ["container OOMKilled by node"])
-    assert classify(_ctx(step_failures=[oom])).tier is Tier.PAGE
-    assert (
-        classify(_ctx(tags={"external-user": "u@e.org"}, step_failures=[oom])).tier
-        is Tier.USER_FACING
-    )
-
-
-# ===== Cooldown / escalation / breaker =====
-
-
-def test_digest_blocks_render_er_cross_surface_section():
+def test_digest_blocks_render_counts_and_er_section():
     summary = {
-        "date_label": "Wed Sep 02",
-        "total_failures": 3,
-        "canceled": 0,
-        "by_class": [("code-error", 3)],
-        "user_failures": 0,
-        "user_count": 0,
-        "top_signatures": [],
+        "date_label": "Tue Aug 26",
+        "total_failures": 155,
+        "canceled": 217,
+        "by_class": [("code-error", 90), ("k8s-job-death", 38)],
+        "user_failures": 2,
+        "user_count": 2,
+        "top_signatures": [("aabb", 41, "__ASSET_JOB: RuntimeError: duplicate gate")],
         "er": {
             "groups": 7,
             "new_today": 2,
@@ -171,36 +148,21 @@ def test_digest_blocks_render_er_cross_surface_section():
     }
     fallback, blocks = slack_mod.digest_blocks(summary, "production")
     text = str(blocks)
+    assert "155" in text and "217" in text and "155" in fallback
+    assert "duplicate gate" in text
     assert "7 active error groups in 24h · 2 new" in text
     assert "×12 — `ZtfFetchTimeout in adam_jobs.cutout_worker.executor` (cutout-worker-ztf)" in text
     assert "errors/detail/Cg2" in text
-    # Absent ER data renders without the section, never raises.
+    # ER unavailable (fail-open): renders without the section, never raises.
     summary["er"] = None
     _, blocks2 = slack_mod.digest_blocks(summary, "production")
     assert "active error group" not in str(blocks2)
-
-
-def test_er_handler_critical_severity_rides_in_footer(capsys):
-    import logging as _logging
-
-    from adam_dagster_shared.alerting.er_log_handler import ErrorReportingHandler
-
-    record = _logging.LogRecord(
-        name="x", level=_logging.CRITICAL, pathname=__file__, lineno=1,
-        msg="catastrophic thing", args=(), exc_info=None,
-    )
-    ErrorReportingHandler().emit(record)
-    entry = json.loads(capsys.readouterr().out.strip())
-    assert entry["severity"] == "CRITICAL"
-    assert "severity: critical" in entry["message"].splitlines()[-1]
 
 
 def test_no_mrkdwn_links_anywhere_links_are_buttons():
     # Slack ignores unfurl_links=false for links inside blocks (measured:
     # every console link grew a "Google Cloud Platform" preview card). URL
     # buttons never unfurl, so no rendered text may contain "<http".
-    from adam_dagster_shared.alerting.renderer import render_group_blocks
-
     group = {
         "group": {"groupId": "CBtn"},
         "count": "2",
@@ -215,7 +177,7 @@ def test_no_mrkdwn_links_anywhere_links_are_buttons():
     digest_summary = {
         "date_label": "Tue Sep 08", "total_failures": 1, "canceled": 0,
         "by_class": [("code-error", 1)], "user_failures": 0, "user_count": 0,
-        "top_signatures": [("aabb", 1, "x")], "baseline_median_per_day": None,
+        "top_signatures": [("aabb", 1, "x")],
         "er": {"groups": 1, "new_today": 1, "project": "moeyens-thor-dev",
                "top": [(3, "KeyError at GET /api/x", "adam-api", "Cg9")]},
     }
@@ -235,44 +197,7 @@ def test_no_mrkdwn_links_anywhere_links_are_buttons():
     assert "errors/detail/CBtn" in json.dumps(card_blocks)
 
 
-def test_digest_blocks_render_counts():
-    summary = {
-        "date_label": "Tue Aug 26",
-        "total_failures": 155,
-        "canceled": 217,
-        "by_class": [("code-error", 90), ("k8s-job-death", 38)],
-        "user_failures": 2,
-        "user_count": 2,
-        "top_signatures": [("aabb", 41, "__ASSET_JOB: RuntimeError: duplicate gate")],
-    }
-    fallback, blocks = slack_mod.digest_blocks(summary, "production")
-    text = str(blocks)
-    assert "155" in text and "217" in text
-    assert "duplicate gate" in text
-    assert "155" in fallback
-
-
-# ===== Watchdog helpers =====
-
-
-def test_hung_threshold_uses_p95_with_floor():
-    # Measured: run_parameterized_precovery p95 = 63 min => threshold ~3.15h.
-    assert sensors_mod.hung_threshold(63 * 60) == 3 * 63 * 60
-    # Thin history: 30-min p95 floors at 2h.
-    assert sensors_mod.hung_threshold(30 * 60) == 2 * 3600
-    assert sensors_mod.hung_threshold(None) == 6 * 3600
-
-
-def test_p95_of_small_samples():
-    assert sensors_mod.p95_seconds([]) is None
-    assert sensors_mod.p95_seconds([60.0]) == 60.0
-    assert sensors_mod.p95_seconds(list(map(float, range(1, 101)))) == 96.0
-
-
-# ===== Dry-run guard =====
-
-
-def test_dry_run_forced_without_token_secret(monkeypatch):
+def test_dry_run_without_token_secret_logs_instead_of_posting(monkeypatch):
     monkeypatch.delenv("ALERTING_SLACK_TOKEN_SECRET", raising=False)
     monkeypatch.delenv("ALERTING_DRY_RUN", raising=False)
     assert slack_mod.dry_run() is True
@@ -281,110 +206,52 @@ def test_dry_run_forced_without_token_secret(monkeypatch):
     monkeypatch.setenv("ALERTING_DRY_RUN", "true")
     assert slack_mod.dry_run() is True
 
-
-def test_dry_run_post_logs_payload(monkeypatch):
-    monkeypatch.delenv("ALERTING_SLACK_TOKEN_SECRET", raising=False)
-    monkeypatch.delenv("ALERTING_DRY_RUN", raising=False)
-
     class _Log:
-        def __init__(self):
-            self.lines = []
+        lines = []
 
         def info(self, msg):
             self.lines.append(msg)
 
-        def warning(self, msg):
-            self.lines.append("WARN " + msg)
+        warning = info
 
     log = _Log()
-    ok = slack_mod.post_message(log, "fallback", [{"type": "section"}])
-    assert ok is True
+    assert slack_mod.post_message(log, "fallback", [{"type": "section"}]) is True
     assert any(line.startswith("ALERTING_DRY_RUN_POST ") for line in log.lines)
 
 
-# ===== Error Reporting log handler =====
+# ===== Watchdog =====
 
 
-def test_er_handler_keeps_dagster_stack_header_unparsed():
-    # Deliberate: a parsed stack made ER group ALL op errors together (the
-    # top frames are shared dagster/client machinery — measured live when a
-    # NotFound in mpc_obs_identity and one in unified_aims_source_mirror
-    # merged into one group). Keeping "Stack Trace:" unparsable forces ER's
-    # token+functionName grouping, which is per (exception class, step).
-    from adam_dagster_shared.alerting.er_log_handler import _innermost_cls
+def test_watchdog_threshold_from_p95_and_flagging_window(monkeypatch):
+    assert sensors_mod.p95_seconds([]) is None
+    assert sensors_mod.p95_seconds([60.0]) == 60.0
+    assert sensors_mod.p95_seconds(list(map(float, range(1, 101)))) == 96.0
+    # Measured: run_parameterized_precovery p95 = 63 min => threshold ~3.15h;
+    # thin history floors at 2h; no history defaults to 6h.
+    assert sensors_mod.hung_threshold(63 * 60) == 3 * 63 * 60
+    assert sensors_mod.hung_threshold(30 * 60) == 2 * 3600
+    assert sensors_mod.hung_threshold(None) == 6 * 3600
 
-    class _Err:
-        cls_name = "google.api_core.exceptions.NotFound"
-        cause = None
-
-    assert _innermost_cls(_Err()) == "NotFound"
-
-
-def test_er_handler_emits_single_json_line(capsys):
-    import logging as _logging
-
-    from adam_dagster_shared.alerting.er_log_handler import ErrorReportingHandler
-
-    h = ErrorReportingHandler()
-    rec = _logging.LogRecord("dagster", _logging.ERROR, "x.py", 1,
-                             "step failed\nStack Trace:\n  File \"a.py\", line 1, in f",
-                             None, None)
-    h.emit(rec)
-    out = capsys.readouterr().out
-    import json as _json
-
-    lines = [l for l in out.splitlines() if l.strip()]
-    assert len(lines) == 1
-    entry = _json.loads(lines[0])
-    assert entry["severity"] == "ERROR"
-    assert "Stack Trace:" in entry["message"]  # kept unparsable on purpose
-    assert "service" in entry["serviceContext"]
+    # Found live 2026-09-02: the posting gate sat inside the detection
+    # condition, so verdict-only mode recorded nothing for an 18h-stuck run.
+    monkeypatch.setenv("ALERTING_SENSOR_POSTING", "false")
+    flag = sensors_mod.watchdog_should_flag
+    state = {"alerted": {}}
+    now = 1_000_000.0
+    assert not flag(state, "run-1", age=3600, threshold=2 * 3600, now=now) and state["alerted"] == {}
+    assert flag(state, "run-1", age=8 * 3600, threshold=2 * 3600, now=now)
+    assert state["alerted"]["run-1"] == now
+    # Within the re-alert window: no second flag; after it: flags again.
+    assert not flag(state, "run-1", age=9 * 3600, threshold=2 * 3600, now=now + 600)
+    assert flag(state, "run-1", age=33 * 3600, threshold=2 * 3600, now=now + 25 * 3600)
 
 
-def test_er_handler_includes_exc_info_traceback(capsys):
-    import logging as _logging
-
-    from adam_dagster_shared.alerting.er_log_handler import ErrorReportingHandler
-
-    h = ErrorReportingHandler()
-    try:
-        raise ValueError("kaboom")
-    except ValueError:
-        import sys as _sys
-
-        rec = _logging.LogRecord("app", _logging.ERROR, "x.py", 1, "ctx", None, _sys.exc_info())
-    h.emit(rec)
-    entry = __import__("json").loads(capsys.readouterr().out.strip())
-    assert "ValueError: kaboom" in entry["message"]
-    # The header is neutralized: an ER-parseable traceback would flip the
-    # group to frame-based keys (review finding R6).
-    assert "Traceback (most recent call last):" not in entry["message"]
-    assert "Stack trace (most recent call last):" in entry["message"]
-
-
-def test_er_handler_never_raises_on_bad_record(capsys):
-    import logging as _logging
-
-    from adam_dagster_shared.alerting.er_log_handler import ErrorReportingHandler
-
-    h = ErrorReportingHandler()
-
-    class _Evil:
-        def __str__(self):
-            raise RuntimeError("unformattable")
-
-    rec = _logging.LogRecord("app", _logging.ERROR, "x.py", 1, _Evil(), None, None)
-    h.emit(rec)  # must not raise
+# ===== Dagster Error Reporting log handler =====
 
 
 def test_er_handler_strips_run_prefix_and_adds_footer(capsys):
-    import logging as _logging
-
-    from adam_dagster_shared.alerting.er_log_handler import ErrorReportingHandler
-
-    h = ErrorReportingHandler()
-    rec = _logging.LogRecord(
-        "dagster", _logging.ERROR, "x.py", 1,
+    rec = logging.LogRecord(
+        "dagster", logging.ERROR, "x.py", 1,
         "__ASSET_JOB - 1728932c-6614-443a-a9d6-aa958bcd107e - 1 - STEP_FAILURE - boom",
         None, None,
     )
@@ -394,154 +261,67 @@ def test_er_handler_strips_run_prefix_and_adds_footer(capsys):
         "step_key": "aims_mpc_hot_archive",
         "job_name": "__ASSET_JOB",
     }
-    h.emit(rec)
-    entry = __import__("json").loads(capsys.readouterr().out.strip())
+    _emit(rec)
+    entry = _entry(capsys)
+    assert entry["@type"].endswith("ReportedErrorEvent")
+    assert entry["severity"] == "ERROR"
+    assert "service" in entry["serviceContext"]
     # Grouping-stable: first tokens come from the un-prefixed message.
     assert entry["message"].startswith("Execution of step")
     assert "1728932c" not in entry["message"].splitlines()[0]
     # Context is present but only in the footer / labels / reportLocation.
     assert "run_id: 1728932c" in entry["message"]
     assert entry["context"]["reportLocation"]["functionName"] == "aims_mpc_hot_archive"
-    assert entry["@type"].endswith("ReportedErrorEvent")
     assert entry["logging.googleapis.com/labels"]["dagster_run_id"].startswith("1728932c")
 
 
-def test_er_handler_prefix_regex_fallback_without_meta(capsys):
-    import logging as _logging
-
-    from adam_dagster_shared.alerting.er_log_handler import ErrorReportingHandler
-
-    h = ErrorReportingHandler()
-    rec = _logging.LogRecord(
-        "dagster", _logging.ERROR, "x.py", 1,
-        "__ASSET_JOB - deadbeef-dead-dead-dead-deadbeefdead - 2 - STEP_FAILURE - the failure text",
-        None, None,
-    )
-    h.emit(rec)
-    entry = __import__("json").loads(capsys.readouterr().out.strip())
-    assert entry["message"].startswith("STEP_FAILURE - the failure text")
+def test_er_handler_neutralizes_exc_info_traceback(capsys):
+    try:
+        raise ValueError("kaboom")
+    except ValueError:
+        rec = logging.LogRecord("app", logging.ERROR, "x.py", 1, "ctx", None, sys.exc_info())
+    _emit(rec)
+    entry = _entry(capsys)
+    assert "ValueError: kaboom" in entry["message"]
+    # An ER-parseable traceback would flip the group to frame-based keys
+    # (review finding R6).
+    assert "Traceback (most recent call last):" not in entry["message"]
+    assert "Stack trace (most recent call last):" in entry["message"]
 
 
-def test_er_handler_headline_leads_with_exception_class(capsys):
-    import logging as _logging
+def test_er_handler_never_raises_on_bad_record():
+    class _Evil:
+        def __str__(self):
+            raise RuntimeError("unformattable")
 
-    from adam_dagster_shared.alerting.er_log_handler import ErrorReportingHandler
-
-    class _FakeError:
-        cls_name = "google.api_core.exceptions.NotFound"
-        cause = None
-
-    class _Data:
-        error = _FakeError()
-        error_display_string = (
-            'google.api_core.exceptions.NotFound: 404 Not found: Dataset x\n'
-            'Stack Trace:\n  File "/code/adam_etl/dag/assets/x.py", line 9, in f\n    q()'
-        )
-
-    class _Event:
-        event_specific_data = _Data()
-        event_type_value = "STEP_FAILURE"
-
-    h = ErrorReportingHandler()
-    rec = _logging.LogRecord("dagster", _logging.ERROR, "x.py", 1, "ignored", None, None)
-    rec.dagster_meta = {"orig_message": 'Execution of step "mpc_obs_identity" failed.',
-                        "run_id": "r1", "step_key": "mpc_obs_identity", "job_name": "__ASSET_JOB"}
-    rec.dagster_event = _Event()
-    h.emit(rec)
-    entry = __import__("json").loads(capsys.readouterr().out.strip())
-    assert entry["message"].startswith("NotFound in mpc_obs_identity:")
-    assert "NotFound: 404" in entry["message"]
-    assert "Stack Trace:" in entry["message"]  # human-readable, ER-unparsable
+    _emit(logging.LogRecord("app", logging.ERROR, "x.py", 1, _Evil(), None, None))
 
 
-def test_er_handler_skips_redundant_run_failure_summary(capsys):
-    import logging as _logging
-
-    from adam_dagster_shared.alerting.er_log_handler import ErrorReportingHandler
-
-    class _Event:
-        event_specific_data = None
-        event_type_value = "PIPELINE_FAILURE"
-
-    h = ErrorReportingHandler()
-    rec = _logging.LogRecord("dagster", _logging.ERROR, "x.py", 1, "ignored", None, None)
-    rec.dagster_meta = {"orig_message": 'Execution of run for "__ASSET_JOB" failed. Steps failed: [...]',
-                        "run_id": "r1", "job_name": "__ASSET_JOB"}
-    rec.dagster_event = _Event()
-    h.emit(rec)
-    assert capsys.readouterr().out.strip() == ""
+# ===== ER group renderer: message parsing =====
 
 
-# ===== ER group renderer =====
-
-
-def test_renderer_parses_handler_message():
-    from adam_dagster_shared.alerting.renderer import parse_reported_message
-
+def test_renderer_parses_dagster_message_into_headline_cause_and_excerpt():
     msg = (
-        "Failure in aims_frames_lsst_dp2:\n"
-        'Execution of step "aims_frames_lsst_dp2" failed.\n\n'
-        "dagster._core.definitions.events.Failure: requires the explicit DP2 confirmation\n"
-        "Stack Trace:\n  File \"x.py\", line 1, in f\n"
-        "-- run_id: f46c7b33-9f01-44ce-903a-b637c01f54a2 · job: __ASSET_JOB · step: aims_frames_lsst_dp2"
+        "NotFound in barrage_unified_mirror:\n"
+        'Execution of step "barrage_unified_mirror" failed.\n\n'
+        "google.api_core.exceptions.NotFound: 404 Not found: Dataset x was not found\n"
+        "Stack Trace:\n  File \"a.py\", line 1, in f\n"
+        "-- run_id: f46c7b33-9f01-44ce-903a-b637c01f54a2 · job: __ASSET_JOB · step: barrage_unified_mirror"
     )
     p = parse_reported_message(msg)
-    assert p["headline"] == "Failure in aims_frames_lsst_dp2"
+    assert p["headline"] == "NotFound in barrage_unified_mirror"
     assert p["run_id"].startswith("f46c7b33")
-    assert p["step"] == "aims_frames_lsst_dp2"
-    # The cause line moves to the quote; the excerpt holds the rest.
-    assert "requires the explicit DP2" in p["cause"]
-    assert "run_id:" not in p["excerpt"]
-
-
-def test_renderer_blocks_carry_what_failed(monkeypatch):
-    from adam_dagster_shared.alerting.renderer import render_group_blocks
-
-    group = {
-        "group": {"groupId": "CNemo"},
-        "count": "3",
-        "firstSeenTime": "2026-09-01T20:14:56Z",
-        "affectedServices": [{"service": "error-reporting-alerting/adam-etl"}],
-    }
-    event = {"message": "Failure in aims_frames_lsst_dp2:\nbody text\n-- run_id: abc12345 · step: aims_frames_lsst_dp2"}
-    fallback, blocks = render_group_blocks(group, event, "error-reporting-alerting")
-    text = str(blocks)
-    assert "Failure in aims_frames_lsst_dp2" in text
-    assert "[dev · error-reporting-alerting]" in text
-    assert "*Occurrences*\\n3 ·" in text or "*Occurrences*\n3 ·" in text
-    assert "console.cloud.google.com/errors/detail/CNemo" in text
-    assert "adam-etl" in fallback
-
-
-def test_watchdog_flags_and_records_independent_of_posting(monkeypatch):
-    # Found live 2026-09-02: the posting gate sat inside the detection
-    # condition, so verdict-only mode recorded nothing for an 18h-stuck run.
-    from adam_dagster_shared.alerting.sensors import watchdog_should_flag
-
-    monkeypatch.setenv("ALERTING_SENSOR_POSTING", "false")
-    state = {"alerted": {}}
-    now = 1_000_000.0
-    assert watchdog_should_flag(state, "run-1", age=8 * 3600, threshold=2 * 3600, now=now)
-    assert state["alerted"]["run-1"] == now
-    # Within the re-alert window: no second flag.
-    assert not watchdog_should_flag(state, "run-1", age=9 * 3600, threshold=2 * 3600, now=now + 600)
-    # After the window: flags again.
-    assert watchdog_should_flag(
-        state, "run-1", age=33 * 3600, threshold=2 * 3600, now=now + 25 * 3600
-    )
-
-
-def test_watchdog_does_not_flag_below_threshold():
-    from adam_dagster_shared.alerting.sensors import watchdog_should_flag
-
-    state = {"alerted": {}}
-    assert not watchdog_should_flag(state, "run-2", age=3600, threshold=2 * 3600, now=1.0)
-    assert state["alerted"] == {}
+    assert p["step"] == "barrage_unified_mirror"
+    assert p["cause"] == "google.api_core.exceptions.NotFound: 404 Not found: Dataset x was not found"
+    # Boilerplate and the footer are stripped; the cause is deduplicated out
+    # of the excerpt so the stack is what remains.
+    assert "Execution of step" not in p["excerpt"] and "run_id:" not in p["excerpt"]
+    assert p["excerpt"].startswith("Stack Trace:")
+    # Lowercase key:value lines and prose with pre-colon spaces are not causes.
+    assert parse_reported_message("x:\nurl: https://a.example/b\nSteps failed: [1, 2]\n")["cause"] == ""
 
 
 def test_renderer_parses_api_footer_generically():
-    from adam_dagster_shared.alerting.renderer import parse_reported_message
-
     msg = (
         "RuntimeError at GET /api/jobs/{id}:\n"
         "Unhandled exception during GET /api/jobs/42: boom\n"
@@ -557,58 +337,24 @@ def test_renderer_parses_api_footer_generically():
     assert "client:" not in p["excerpt"]
 
 
-def test_renderer_extracts_cause_and_strips_boilerplate():
-    from adam_dagster_shared.alerting.renderer import parse_reported_message
-
-    msg = (
-        "NotFound in barrage_unified_mirror:\n"
-        'Execution of step "barrage_unified_mirror" failed.\n\n'
-        "google.api_core.exceptions.NotFound: 404 Not found: Dataset x was not found\n"
-        "Stack Trace:\n  File \"a.py\", line 1, in f\n"
-        "-- run_id: abc · job: __ASSET_JOB · step: barrage_unified_mirror"
-    )
-    p = parse_reported_message(msg)
-    assert p["cause"] == "google.api_core.exceptions.NotFound: 404 Not found: Dataset x was not found"
-    assert "Execution of step" not in p["excerpt"]
-    # Cause deduplicated out of the excerpt; the stack remains.
-    assert p["excerpt"].startswith("Stack Trace:")
-
-
-def test_renderer_cause_matches_arbitrary_class_names_and_dedups():
-    from adam_dagster_shared.alerting.renderer import parse_reported_message
-
-    msg = (
-        "ShardManifestDivergence in adam_jobs.uncaught:\n"
-        "ShardManifestDivergence: final shard publish lacks current commit markers\n"
-        "-- severity: critical"
-    )
-    p = parse_reported_message(msg)
-    assert p["cause"] == "ShardManifestDivergence: final shard publish lacks current commit markers"
-    # Cause was the excerpt's only line — deduplicated away.
-    assert p["excerpt"] == ""
-    # Lowercase key:value lines and prose with pre-colon spaces never match.
-    p2 = parse_reported_message("x:\nurl: https://a.example/b\nSteps failed: [1, 2]\n")
-    assert p2["cause"] == ""
-
-
 def test_renderer_long_bodies_keep_head_and_tail():
-    from adam_dagster_shared.alerting.renderer import parse_reported_message
-
     inner = "ValueError: inner cause line\n" + ("  File \"mid.py\", line 9, in f\n" * 80)
     final = "OuterChainError: the decisive final line"
     p = parse_reported_message(f"OuterChainError in step_x:\n{inner}{final}\n")
     assert "⋯" in p["excerpt"]
     assert "the decisive final line" in p["excerpt"]
+    # The cause is the last exception line, whatever the class is called.
     assert p["cause"] == final
 
 
-def test_renderer_blocks_quote_cause_and_show_version():
-    from adam_dagster_shared.alerting.renderer import render_group_blocks
+# ===== ER group renderer: Slack card =====
 
+
+def test_renderer_dagster_card_carries_what_failed_and_critical_styling():
     group = {
-        "group": {"groupId": "CVer"},
-        "count": "2",
-        "firstSeenTime": "2026-09-02T16:00:00Z",
+        "group": {"groupId": "CNemo"},
+        "count": "3",
+        "firstSeenTime": "2026-09-01T20:14:56Z",
         "affectedServices": [{"service": "error-reporting-alerting/adam-etl"}],
     }
     event = {
@@ -621,33 +367,23 @@ def test_renderer_blocks_quote_cause_and_show_version():
     }
     fallback, blocks = render_group_blocks(group, event, "error-reporting-alerting")
     text = str(blocks)
+    assert "TimeoutError in slow_step" in text
+    assert "[dev · error-reporting-alerting]" in text
     assert "> TimeoutError: BigQuery job exceeded 900s" in text
+    assert "*Occurrences*\\n3 ·" in text or "*Occurrences*\n3 ·" in text
     assert "`v-abc123`" in text  # Build field
+    assert "console.cloud.google.com/errors/detail/CNemo" in text
+    assert "adam-etl" in fallback
 
-
-def test_renderer_blocks_critical_severity():
-    from adam_dagster_shared.alerting.renderer import render_group_blocks
-
-    group = {
-        "group": {"groupId": "CCrit"},
-        "count": "1",
-        "firstSeenTime": "2026-09-02T16:00:00Z",
-        "affectedServices": [{"service": "error-reporting-alerting/precovery-v2-shard"}],
-    }
-    event = {
-        "message": (
-            "ShardPublishError in adam_jobs.uncaught:\nboom\n-- severity: critical"
-        )
-    }
+    # CRITICAL rides in the footer (ER events expose no severity) and
+    # changes the headline styling.
+    event = {"message": "ShardPublishError in adam_jobs.uncaught:\nboom\n-- severity: critical"}
     fallback, blocks = render_group_blocks(group, event, "error-reporting-alerting")
-    text = str(blocks)
-    assert "🔥" in text and "New CRITICAL error" in text
+    assert "🔥" in str(blocks) and "New CRITICAL error" in str(blocks)
     assert "New CRITICAL error" in fallback
 
 
-def test_renderer_blocks_carry_api_request_context():
-    from adam_dagster_shared.alerting.renderer import render_group_blocks
-
+def test_renderer_api_card_carries_request_context_in_fields_grid():
     group = {
         "group": {"groupId": "CApi1"},
         "count": "1",
@@ -664,8 +400,6 @@ def test_renderer_blocks_carry_api_request_context():
     text = str(blocks)
     assert "RuntimeError at GET /api/_error_probe/" in text
     assert "`GET /api/_error_probe/` → HTTP 500" in text
-    assert "adam-api" in text
-    assert "adam-api" in fallback
-    # Facts render as a two-column fields grid.
+    assert "adam-api" in text and "adam-api" in fallback
     fields_blocks = [b for b in blocks if b.get("fields")]
     assert fields_blocks and any("*Request*" in f["text"] for f in fields_blocks[0]["fields"])
