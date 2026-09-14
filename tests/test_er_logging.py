@@ -1,9 +1,7 @@
-"""Tests for the Error Reporting logging bridge (adam_dagster_shared.er_logging).
+"""Tests for adam_dagster_shared.er_logging.
 
-The handler's contract is a grouping-stability contract: ER groups stackless
-entries by the first 3 message tokens + reportLocation.functionName, so the
-"<Cls> in <logger>" / "<Cls> at <METHOD> /route>" headline and the
-functionName ARE the fingerprint. These tests pin that contract.
+ER groups stackless entries by the first 3 message tokens + reportLocation.functionName,
+so the "<Cls> in <logger>" / "<Cls> at <METHOD> /route>" headline IS the fingerprint.
 """
 
 import json
@@ -15,15 +13,7 @@ from adam_dagster_shared.er_logging import ErrorReportingHandler, maybe_install,
 
 
 def _record(msg="boom", logger_name="adam_jobs.cutout_worker.loop", exc=None, **attrs):
-    record = logging.LogRecord(
-        name=logger_name,
-        level=logging.ERROR,
-        pathname=__file__,
-        lineno=1,
-        msg=msg,
-        args=(),
-        exc_info=None,
-    )
+    record = logging.LogRecord(logger_name, logging.ERROR, __file__, 1, msg, (), None)
     if exc is not None:
         try:
             raise exc
@@ -61,9 +51,7 @@ def test_headline_and_function_name_carry_the_grouping_key(monkeypatch, capsys):
     assert entry["message"].startswith("ValueError in adam_jobs.cutout_worker.loop:")
     assert entry["context"]["reportLocation"]["functionName"] == "adam_jobs.cutout_worker.loop"
     assert entry["serviceContext"] == {"service": "unit-test-ns/cutout-worker-ztf", "version": "unknown"}
-    # Every traceback header is rewritten (chained exceptions carry several):
-    # one intact header would flip ER to frame-based grouping (review R6).
-    # The frames themselves survive for humans.
+    # Every traceback header is rewritten (one intact header flips ER to frame-based grouping).
     assert "Traceback (most recent call last):" not in entry["message"]
     assert entry["message"].count("Stack trace (most recent call last):") == 2
     assert "in test_headline_and_function_name_carry_the_grouping_key" in entry["message"]
@@ -78,8 +66,6 @@ def test_never_raises_on_hostile_record(monkeypatch, capsys):
 
 
 def test_maybe_install_chains_excepthook_and_reports_uncaught_as_critical(monkeypatch, capsys):
-    # A raise escaping main() never reaches a logging handler — the shard
-    # entrypoint's real failure mode — so maybe_install chains sys.excepthook.
     monkeypatch.setenv("ER_LOGGING_ENABLED", "true")
     monkeypatch.setenv("GARDEN_NAMESPACE", "unit-test-ns")
     monkeypatch.setenv("ER_SERVICE_NAME", "precovery-v2-shard")
@@ -92,19 +78,17 @@ def test_maybe_install_chains_excepthook_and_reports_uncaught_as_critical(monkey
         assert maybe_install() is True
         assert maybe_install() is True  # idempotent
         assert len([h for h in root.handlers if isinstance(h, ErrorReportingHandler)]) == 1
-        assert sys.excepthook is er._logging_excepthook
+        assert sys.excepthook is er._excepthook
         try:
             raise RuntimeError("final shard publish lacks current commit markers")
         except RuntimeError:
             sys.excepthook(*sys.exc_info())
         out = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
         assert len(out) == 1
-        entry = out[0]
-        assert entry["severity"] == "CRITICAL"
-        assert entry["message"].startswith("RuntimeError in adam.uncaught:")
-        # Renderer styles CRITICAL from the footer (ER events carry no severity).
-        assert entry["message"].splitlines()[-1] == "-- severity: critical"
-        assert entry["serviceContext"]["service"] == "unit-test-ns/precovery-v2-shard"
+        assert out[0]["severity"] == "CRITICAL"
+        assert out[0]["message"].startswith("RuntimeError in adam.uncaught:")
+        assert out[0]["message"].splitlines()[-1] == "-- severity: critical"  # renderer styles from this
+        assert out[0]["serviceContext"]["service"] == "unit-test-ns/precovery-v2-shard"
         assert chained, "original excepthook must still run"
     finally:
         root.handlers = before
@@ -112,14 +96,8 @@ def test_maybe_install_chains_excepthook_and_reports_uncaught_as_critical(monkey
         er._original_excepthook = None
 
 
-# ===== Request-carrying records (web-service flavor, from adam-api) =====
-
-
 def test_request_records_group_by_normalized_route(monkeypatch, capsys):
-    assert (
-        normalize_path("/v1/jobs/123e4567-e89b-12d3-a456-426614174000/results/42")
-        == "/v1/jobs/{id}/results/{id}"
-    )
+    assert normalize_path("/v1/jobs/123e4567-e89b-12d3-a456-426614174000/results/42") == "/v1/jobs/{id}/results/{id}"
     record = _record("Unhandled exception during GET x: boom", logger_name="api.api",
                      exc=ValueError("boom"), http_method="GET", http_path="/v1/jobs/9999", http_status=500)
     entry = _emit(monkeypatch, capsys, record, service="adam-api")
@@ -139,11 +117,8 @@ def test_security_records_group_per_class_not_per_probed_path(monkeypatch, capsy
 
 
 def test_django_request_echo_is_skipped_unless_it_carries_an_exception(monkeypatch, capsys):
-    # Django logs "Internal Server Error: /path" (no exc_info) for every 5xx
-    # response — a duplicate of the application handler's rich record.
+    # Django's "Internal Server Error: /path" (no exc_info) duplicates the application record.
     echo = _record("Internal Server Error: /api/x", logger_name="django.request", status_code=500)
     assert _emit(monkeypatch, capsys, echo, service="adam-api") is None
     real = _record("Internal Server Error: /api/x", logger_name="django.request", exc=KeyError("boom"))
-    assert _emit(monkeypatch, capsys, real, service="adam-api")["message"].startswith(
-        "KeyError in django.request:"
-    )
+    assert _emit(monkeypatch, capsys, real, service="adam-api")["message"].startswith("KeyError in django.request:")

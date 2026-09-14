@@ -1,23 +1,13 @@
-"""Slack message rendering and posting for the alerting pipeline.
+"""Slack posting and Block Kit builders.
 
-Posting is deliberately boring: chat.postMessage with a bot token, one
-channel, Block Kit bodies built by pure functions (testable without Slack).
-
-Configuration (all env):
-- ALERTING_SLACK_CHANNEL     target channel id (default: #engineering-gcp-alerts)
-- ALERTING_SLACK_TOKEN_SECRET  full Secret Manager resource name of the bot
-  token (projects/.../secrets/.../versions/latest). Unset => dry-run: the
-  exact payload is logged instead of posted. The token is fetched at runtime
-  (google-auth is already a transitive dependency) and cached in-process —
-  never mounted via envSecrets, which the run launcher would propagate to
-  every run pod as a hard requirement (see ai-garden dagster/garden.yml).
-
-Every function swallows its own errors and reports success as a bool: a
-Slack outage must never fail a sensor tick or a digest run.
+Dry-run (payload logged, nothing posted) unless ALERTING_SLACK_TOKEN_SECRET names
+the bot token in Secret Manager; ALERTING_DRY_RUN=true forces dry-run. Posting never
+raises: success is reported as a bool.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import time
@@ -25,16 +15,12 @@ from typing import Any
 
 import requests
 
+from adam_dagster_shared.er_logging import env_flag
 
 DEFAULT_CHANNEL = "C05KNK4KZFA"  # #engineering-gcp-alerts
-
-
-# One namespace resolution for the whole package (env, serviceaccount file,
-# "local") — three drifting fallbacks was a measured review finding.
-from adam_dagster_shared.er_logging import current_namespace  # noqa: E402,F401
-
-_token_cache: dict[str, tuple[str, float]] = {}
+PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "moeyens-thor-dev")
 _TOKEN_TTL_SECONDS = 15 * 60
+_token_cache: dict[str, tuple[str, float]] = {}
 
 
 def channel_id() -> str:
@@ -42,44 +28,32 @@ def channel_id() -> str:
 
 
 def dry_run() -> bool:
-    """Dry-run unless a token secret is configured and not explicitly forced."""
-    if os.environ.get("ALERTING_DRY_RUN", "").strip().lower() in ("1", "true", "yes"):
-        return True
-    return not os.environ.get("ALERTING_SLACK_TOKEN_SECRET", "").strip()
+    return env_flag("ALERTING_DRY_RUN") or not os.environ.get(
+        "ALERTING_SLACK_TOKEN_SECRET", ""
+    ).strip()
 
 
 def env_prefix(namespace: str) -> str:
-    """Non-production posts announce their namespace so shared-channel
-    readers can tell validation traffic from production signal."""
-    if namespace == "production":
-        return ""
-    return f"[dev · {namespace}] "
+    return "" if namespace == "production" else f"[dev · {namespace}] "
 
 
 def _fetch_bot_token(log) -> str | None:
     secret_name = os.environ.get("ALERTING_SLACK_TOKEN_SECRET", "").strip()
-    if not secret_name:
-        return None
     cached = _token_cache.get(secret_name)
     if cached and time.monotonic() - cached[1] < _TOKEN_TTL_SECONDS:
         return cached[0]
     try:
-        # Lazy import: only the poster needs auth, and only outside dry-run.
         import google.auth
         from google.auth.transport.requests import AuthorizedSession
 
         credentials, _ = google.auth.default(
             scopes=["https://www.googleapis.com/auth/cloud-platform"]
         )
-        session = AuthorizedSession(credentials)
-        resp = session.get(
-            f"https://secretmanager.googleapis.com/v1/{secret_name}:access",
-            timeout=10,
+        resp = AuthorizedSession(credentials).get(
+            f"https://secretmanager.googleapis.com/v1/{secret_name}:access", timeout=10
         )
         resp.raise_for_status()
-        import base64
-
-        token = base64.b64decode(resp.json()["payload"]["data"]).decode("utf-8").strip()
+        token = base64.b64decode(resp.json()["payload"]["data"]).decode().strip()
         _token_cache[secret_name] = (token, time.monotonic())
         return token
     except Exception as exc:
@@ -88,13 +62,10 @@ def _fetch_bot_token(log) -> str | None:
 
 
 def post_message(log, text: str, blocks: list[dict[str, Any]]) -> bool:
-    """Post (or, in dry-run, log) one message. Returns True on success."""
     payload = {
         "channel": channel_id(),
         "text": text,
         "blocks": blocks,
-        # Console/ER links would each unfurl into a giant generic
-        # "Google Cloud Platform" preview card under the message.
         "unfurl_links": False,
         "unfurl_media": False,
     }
@@ -107,7 +78,7 @@ def post_message(log, text: str, blocks: list[dict[str, Any]]) -> bool:
     try:
         resp = requests.post(
             "https://slack.com/api/chat.postMessage",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {token}"},
             json=payload,
             timeout=5,
         )
@@ -124,30 +95,20 @@ def post_message(log, text: str, blocks: list[dict[str, Any]]) -> bool:
         return False
 
 
-# ===== Block builders (pure) =====
+# Block Kit builders. Links go in URL buttons only: Slack ignores unfurl_links=false
+# for links inside blocks, and buttons never unfurl.
 
 
-def _ctx_block(text: str) -> dict[str, Any]:
-    return {"type": "context", "elements": [{"type": "mrkdwn", "text": text[:2900]}]}
-
-
-def _section(text: str) -> dict[str, Any]:
+def section(text: str) -> dict[str, Any]:
     return {"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}}
 
 
-def link_button(label: str, url: str) -> dict[str, Any]:
-    """Block Kit URL button.
+def context_block(text: str) -> dict[str, Any]:
+    return {"type": "context", "elements": [{"type": "mrkdwn", "text": text[:2900]}]}
 
-    Links live in buttons, never in mrkdwn text: Slack's unfurl_links=false
-    is not honored for links inside blocks (measured — every console link
-    grew a giant "Google Cloud Platform" preview card), while URL buttons
-    never unfurl.
-    """
-    return {
-        "type": "button",
-        "text": {"type": "plain_text", "text": label[:75]},
-        "url": url[:3000],
-    }
+
+def link_button(label: str, url: str) -> dict[str, Any]:
+    return {"type": "button", "text": {"type": "plain_text", "text": label[:75]}, "url": url[:3000]}
 
 
 def actions_block(buttons: list[dict[str, Any]]) -> dict[str, Any]:
@@ -155,45 +116,30 @@ def actions_block(buttons: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def digest_blocks(summary: dict[str, Any], namespace: str) -> tuple[str, list[dict[str, Any]]]:
-    """Render the daily digest from a plain summary dict (see digest.py)."""
-    prefix = env_prefix(namespace)
     total = summary["total_failures"]
-    head = f"📋 *{prefix}Daily error digest — {summary['date_label']}*"
-    lines = [head, f"*Failures: {total}* · canceled: {summary['canceled']}"]
-
+    lines = [
+        f"📋 *{env_prefix(namespace)}Daily error digest — {summary['date_label']}*",
+        f"*Failures: {total}* · canceled: {summary['canceled']}",
+    ]
     if summary["by_class"]:
-        class_bits = [f"{klass} {count}" for klass, count in summary["by_class"]]
-        lines.append("*By class:* " + " · ".join(class_bits))
+        lines.append("*By class:* " + " · ".join(f"{k} {n}" for k, n in summary["by_class"]))
     if summary["user_failures"]:
         lines.append(
             f"*Users:* {summary['user_failures']} user-job failures "
             f"({summary['user_count']} users) — handled on their job messages"
         )
-    if summary["top_signatures"]:
-        sig_lines = [
-            f"• ×{count} — {label[:140]} (`{sig[:8]}`)"
-            for sig, count, label in summary["top_signatures"]
-        ]
-        lines.append("*Top Dagster signatures:*\n" + "\n".join(sig_lines))
+    blocks = [section("\n".join(lines))]
 
-    blocks = [_section("\n".join(lines))]
-
-    # Cross-surface section from Error Reporting (covers adam-api, cutout
-    # workers, shards — everything bridged; the sweep above is Dagster-only).
-    er = summary.get("er")
     buttons = []
+    er = summary.get("er")
     if not er:
-        # An unavailable cross-surface view must be visible, not silently
-        # absent — a digest that quietly narrows to Dagster-only misleads.
-        blocks.append(
-            _section("*Across all services (Error Reporting):* unavailable this run")
-        )
+        blocks.append(section("*Across all services (Error Reporting):* unavailable this run"))
     else:
-        maybe = "" if er.get("complete", True) else " (scan capped; counts are a lower bound)"
+        plural = "s" if er["groups"] != 1 else ""
+        capped = "" if er.get("complete", True) else " (scan capped; counts are a lower bound)"
         er_lines = [
-            f"*Across all services (Error Reporting):* "
-            f"{er['groups']} active error group{'s' if er['groups'] != 1 else ''} in 24h · "
-            f"{er['new_today']} new{maybe}"
+            f"*Across all services (Error Reporting):* {er['groups']} active error "
+            f"group{plural} in 24h · {er['new_today']} new{capped}"
         ]
         for count, headline, service, group_id in er.get("top", []):
             er_lines.append(f"• ×{count} — `{headline}` ({service})")
@@ -201,18 +147,16 @@ def digest_blocks(summary: dict[str, Any], namespace: str) -> tuple[str, list[di
                 link_button(
                     f"×{count} {headline}",
                     f"https://console.cloud.google.com/errors/detail/{group_id};time=P7D"
-                    f"?project={er['project']}",
+                    f"?project={PROJECT}",
                 )
             )
-        blocks.append(_section("\n".join(er_lines)))
-
+        blocks.append(section("\n".join(er_lines)))
     buttons.append(
         link_button(
             "Error Reporting console",
-            "https://console.cloud.google.com/errors?project=moeyens-thor-dev",
+            f"https://console.cloud.google.com/errors?project={PROJECT}",
         )
     )
     blocks.append(actions_block(buttons))
-    blocks.append(_ctx_block("covers the last 24h"))
-    fallback = f"Daily error digest: {total} failures"
-    return fallback, blocks
+    blocks.append(context_block("covers the last 24h"))
+    return f"Daily error digest: {total} failures", blocks
