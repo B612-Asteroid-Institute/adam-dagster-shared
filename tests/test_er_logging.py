@@ -8,8 +8,17 @@ import json
 import logging
 import sys
 
+import pytest
+
 import adam_dagster_shared.er_logging as er
-from adam_dagster_shared.er_logging import ErrorReportingHandler, maybe_install, normalize_path
+from adam_dagster_shared.er_logging import ErrorReportingHandler, normalize_path
+
+
+@pytest.fixture(autouse=True)
+def restore_excepthook():
+    before, before_original = sys.excepthook, er._original_excepthook
+    yield
+    sys.excepthook, er._original_excepthook = before, before_original
 
 
 def _record(msg="boom", logger_name="adam_jobs.cutout_worker.loop", exc=None, **attrs):
@@ -65,35 +74,31 @@ def test_never_raises_on_hostile_record(monkeypatch, capsys):
     assert _emit(monkeypatch, capsys, _record(msg=Hostile())) is None
 
 
-def test_maybe_install_chains_excepthook_and_reports_uncaught_as_critical(monkeypatch, capsys):
+def test_handler_chains_excepthook_and_reports_uncaught_as_critical(monkeypatch, capsys):
     monkeypatch.setenv("ER_LOGGING_ENABLED", "true")
     monkeypatch.setenv("GARDEN_NAMESPACE", "unit-test-ns")
     monkeypatch.setenv("ER_SERVICE_NAME", "precovery-v2-shard")
+    chained = []
+    sys.excepthook = lambda *a: chained.append(a)
     root = logging.getLogger()
     before = list(root.handlers)
-    before_hook = sys.excepthook
-    chained = []
     try:
-        sys.excepthook = lambda *a: chained.append(a)
-        assert maybe_install() is True
-        assert maybe_install() is True  # idempotent
-        assert len([h for h in root.handlers if isinstance(h, ErrorReportingHandler)]) == 1
-        assert sys.excepthook is er._excepthook
+        root.addHandler(ErrorReportingHandler())
+        ErrorReportingHandler()  # a second construction must not re-chain
+        assert sys.excepthook is er._excepthook and er._original_excepthook is not er._excepthook
         try:
             raise RuntimeError("final shard publish lacks current commit markers")
         except RuntimeError:
             sys.excepthook(*sys.exc_info())
-        out = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
-        assert len(out) == 1
-        assert out[0]["severity"] == "CRITICAL"
-        assert out[0]["message"].startswith("RuntimeError in adam.uncaught:")
-        assert out[0]["message"].splitlines()[-1] == "-- severity: critical"  # renderer styles from this
-        assert out[0]["serviceContext"]["service"] == "unit-test-ns/precovery-v2-shard"
-        assert chained, "original excepthook must still run"
     finally:
         root.handlers = before
-        sys.excepthook = before_hook
-        er._original_excepthook = None
+    out = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+    assert len(out) == 1
+    assert out[0]["severity"] == "CRITICAL"
+    assert out[0]["message"].startswith("RuntimeError in adam.uncaught:")
+    assert out[0]["message"].splitlines()[-1] == "-- severity: critical"  # renderer styles from this
+    assert out[0]["serviceContext"]["service"] == "unit-test-ns/precovery-v2-shard"
+    assert len(chained) == 1, "original excepthook must still run, once"
 
 
 def test_request_records_group_by_normalized_route(monkeypatch, capsys):

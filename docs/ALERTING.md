@@ -15,7 +15,10 @@ failures plus a cross-surface ER overview.
 |---|---|---|
 | Every Dagster code location | `alerting/er_log_handler.py`, attached instance-wide via the Helm chart's `pythonLogs.dagsterHandlerConfig` | (exception class, step) |
 | Django services (adam-api) | `er_logging.ErrorReportingHandler` on the root logger via settings LOGGING | (exception class, `METHOD /route/{id}`) |
-| Workers (adam-jobs) | `er_logging.maybe_install()` after `logging.basicConfig` at process start; also chains `sys.excepthook` so uncaught exceptions report CRITICAL | (exception class, logger name) |
+| Workers (adam-jobs) | `er_logging.ErrorReportingHandler` in `logging.basicConfig(handlers=[...])` | (exception class, logger name) |
+
+Constructing `er_logging.ErrorReportingHandler` also chains `sys.excepthook`, so an uncaught
+exception in a service or worker reports as CRITICAL.
 
 Not covered: SIGKILL/OOM terminations, non-Python containers, silently missing schedules.
 

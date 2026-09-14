@@ -128,10 +128,14 @@ def _request_bits(record: logging.LogRecord) -> dict:
 
 
 class ErrorReportingHandler(logging.Handler):
-    """Root handler: one ER JSON line per ERROR+ record."""
+    """One ER JSON line per ERROR+ record; pass to ``basicConfig(handlers=[...])`` or dictConfig.
+
+    Constructing it also chains ``sys.excepthook`` so uncaught exceptions report as CRITICAL.
+    """
 
     def __init__(self, level: int | str = logging.ERROR):
         super().__init__(level=level)
+        _chain_excepthook()
 
     def emit(self, record: logging.LogRecord) -> None:
         if not env_flag("ER_LOGGING_ENABLED"):
@@ -203,18 +207,8 @@ def _excepthook(exc_type, exc, tb):
         _original_excepthook(exc_type, exc, tb)
 
 
-def maybe_install() -> bool:
-    """Attach the handler to the root logger and chain sys.excepthook; idempotent.
-
-    Call AFTER ``logging.basicConfig``: a handler already on the root logger makes
-    a later basicConfig a no-op, silently dropping the process's console logging.
-    """
+def _chain_excepthook() -> None:
     global _original_excepthook
-    root = logging.getLogger()
-    if not any(isinstance(h, ErrorReportingHandler) for h in root.handlers):
-        root.addHandler(ErrorReportingHandler())
-    enabled = env_flag("ER_LOGGING_ENABLED")
-    if enabled and sys.excepthook is not _excepthook:
+    if env_flag("ER_LOGGING_ENABLED") and sys.excepthook is not _excepthook:
         _original_excepthook = sys.excepthook
         sys.excepthook = _excepthook
-    return enabled
