@@ -5,6 +5,7 @@ and Slack at module boundaries; the last test runs a real ephemeral Dagster inst
 """
 
 import datetime as dt
+import datetime
 import json
 import logging
 import sys
@@ -304,7 +305,8 @@ def test_parse_reported_message_dagster_api_and_long_bodies():
 
 
 def test_render_group_blocks_dagster_api_and_critical_cards():
-    g = group("CNemo", [f"{NS}/adam-etl"], count="3")
+    recent = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    g = group("CNemo", [f"{NS}/adam-etl"], count="3", first_seen=recent)
     ev = {
         "serviceContext": {"service": f"{NS}/adam-etl", "version": "v-abc123"},
         "message": "TimeoutError in slow_step:\nsome context\nTimeoutError: BigQuery job exceeded 900s\n-- run_id: deadbeef · step: slow_step",
@@ -318,13 +320,17 @@ def test_render_group_blocks_dagster_api_and_critical_cards():
     assert "<http" not in text and "errors/detail/CNemo" in _buttons(blocks)[0]["url"]
 
     ev = {"message": "RuntimeError at GET /api/_error_probe/:\nboom\n-- request: GET /api/_error_probe/ · status: 500"}
-    _, blocks = render_group_blocks(group("CApi1", [f"{NS}/adam-api"]), ev, NS, f"{NS}/adam-api")
+    _, blocks = render_group_blocks(group("CApi1", [f"{NS}/adam-api"], first_seen=recent), ev, NS, f"{NS}/adam-api")
     fields = [b for b in blocks if b.get("fields")][0]["fields"]
     assert any(f["text"] == "*Request*\n`GET /api/_error_probe/` → HTTP 500" for f in fields)
 
     ev = {"message": "ShardPublishError in adam.uncaught:\nboom\n-- severity: critical"}
     fallback, blocks = render_group_blocks(g, ev, NS, f"{NS}/adam-etl")
     assert blocks[0]["text"]["text"].startswith("🔥") and fallback.startswith("New CRITICAL error")
+
+    old = dict(g, firstSeenTime="2020-01-01T00:00:00Z")
+    fallback, _ = render_group_blocks(old, ev, NS, f"{NS}/adam-etl")
+    assert fallback.startswith("CRITICAL error resurfaced")
 
 
 # ===== Renderer: delivery semantics =====

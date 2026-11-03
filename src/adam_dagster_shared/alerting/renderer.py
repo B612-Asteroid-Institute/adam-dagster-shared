@@ -160,7 +160,11 @@ def render_group_blocks(group_stat: dict, event: dict, namespace: str, service: 
     group_id = group_stat.get("group", {}).get("groupId", "")
     location = service.split("/", 1)[-1] or "dagster"
     critical = meta.get("severity", "").lower() == "critical"
-    label = "New CRITICAL error" if critical else "New error class"
+    first = _parse_time(group_stat.get("firstSeenTime", ""))
+    # ER keeps a group's first-seen across quiet spells; a class the renderer has not seen but ER has is a return, not news.
+    resurfaced = bool(first) and (datetime.datetime.now(datetime.timezone.utc) - first).total_seconds() > 86400
+    label = ("CRITICAL error" if critical else "Error class") + (" resurfaced" if resurfaced else "")
+    label = label if resurfaced else "New " + label
     head = f"{'🔥' if critical else '🔴'} *{env_prefix(namespace)}{label}* — `{p['headline']}`"
     if p["cause"] and p["cause"] not in p["headline"]:
         head += f"\n> {p['cause'][:300]}"
