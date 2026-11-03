@@ -110,7 +110,8 @@ def _relative(iso: str) -> str:
 def parse_reported_message(message: str) -> dict:
     """Split a handler-formatted message into headline, cause line, excerpt and footer meta."""
     lines = message.splitlines()
-    headline = lines[0].rstrip(":") if lines else "error"
+    # Log-only errors have no exception line; cap so a prose message cannot become the card.
+    headline = (lines[0].rstrip(":") if lines else "error")[:160]
     body = lines[1:]
     meta: dict[str, str] = {}
     if body and body[-1].startswith("-- "):

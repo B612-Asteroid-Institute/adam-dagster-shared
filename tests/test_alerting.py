@@ -282,6 +282,7 @@ def test_parse_reported_message_dagster_api_and_long_bodies():
         "-- run_id: f46c7b33-9f01-44ce-903a-b637c01f54a2 · job: __ASSET_JOB · step: barrage_unified_mirror"
     )
     assert p["headline"] == "NotFound in barrage_unified_mirror"
+    assert len(parse_reported_message("x" * 400)["headline"]) == 160
     assert p["meta"]["run_id"].startswith("f46c7b33") and p["meta"]["step"] == "barrage_unified_mirror"
     assert p["cause"] == "google.api_core.exceptions.NotFound: 404 Not found: Dataset x was not found"
     assert p["excerpt"].startswith("Stack Trace:")  # boilerplate, cause and footer stripped
