@@ -42,6 +42,12 @@ _BOILERPLATE = re.compile(
 )
 # "<ExceptionClass>: message" — the most diagnostic single line.
 _CAUSE = re.compile(r"^(?:[A-Za-z_]\w*\.)*[A-Z]\w*: \S.*")
+# Exception-looking prefixes only (dotted path or a conventional suffix): multi-line messages such as
+# BigQuery's "Location: us-west1" / "Job ID: ..." otherwise win the last-match rule.
+_CAUSE_STRONG = re.compile(
+    r"^(?:(?:[A-Za-z_]\w*\.)+[A-Z]\w*|[A-Z]\w*(?:Error|Exception|Warning|Interrupt|Exit|Timeout|Failure|Failed"
+    r"|Denied|Invalid|NotFound|Fault|Abort|Overflow|Cancelled|Canceled|Conflict|Exists)): \S"
+)
 
 
 def _er_get(path: str, params: dict) -> dict:
@@ -119,10 +125,9 @@ def parse_reported_message(message: str) -> dict:
             key, _, value = bit.partition(":")
             if key.strip() and value.strip():
                 meta[key.strip()] = value.strip()
-    cause = ""
-    for line in body:
-        if _CAUSE.match(line.strip()):
-            cause = line.strip()
+    weak = [ln.strip() for ln in body if _CAUSE.match(ln.strip())]
+    strong = [ln for ln in weak if _CAUSE_STRONG.match(ln)]
+    cause = (strong or weak or [""])[-1]
     kept = [ln for ln in body if not _BOILERPLATE.match(ln.strip())]
     # The cause renders as its own quoted line; don't repeat it at the top of the excerpt.
     while kept and (not kept[0].strip() or kept[0].strip() == cause):

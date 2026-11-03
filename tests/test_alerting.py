@@ -284,6 +284,12 @@ def test_parse_reported_message_dagster_api_and_long_bodies():
     )
     assert p["headline"] == "NotFound in barrage_unified_mirror"
     assert len(parse_reported_message("x" * 400)["headline"]) == 160
+    bq = parse_reported_message(
+        "NotFound in aims_detections_hot:\nExceeded max_retries of 3:\n\n"
+        "google.api_core.exceptions.NotFound: 404 Not found: Dataset x was not found in location us-west1\n\n"
+        "Location: us-west1\nJob ID: f1ff5294\n\nStack Trace:\n  File \"a.py\", line 1, in f\n-- step: aims_detections_hot"
+    )
+    assert bq["cause"].startswith("google.api_core.exceptions.NotFound: 404")
     assert p["meta"]["run_id"].startswith("f46c7b33") and p["meta"]["step"] == "barrage_unified_mirror"
     assert p["cause"] == "google.api_core.exceptions.NotFound: 404 Not found: Dataset x was not found"
     assert p["excerpt"].startswith("Stack Trace:")  # boilerplate, cause and footer stripped
