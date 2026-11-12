@@ -185,6 +185,21 @@ def _instigator_url(state, dagster_url: str) -> str:
         return f"{dagster_url}/automation"
 
 
+def innermost_error(error) -> tuple[str, str]:
+    """(class, first message line) of the deepest cause: the daemon wraps a sensor's exception
+    in SensorExecutionError / ScheduleExecutionError, which says nothing about the fault."""
+    node, cls, message = error, "", ""
+    for _ in range(10):
+        if node is None:
+            break
+        cls = (getattr(node, "cls_name", None) or "").rsplit(".", 1)[-1] or cls
+        message = (getattr(node, "message", None) or "").strip() or message
+        node = getattr(node, "cause", None)
+    first = (message.splitlines() or ["tick failed"])[0]
+    prefix = f"{cls}: "
+    return cls or "Error", first[len(prefix):] if first.startswith(prefix) else first
+
+
 def failing_instigators(instance, since: float) -> list[tuple]:
     """(state, failed ticks newest-first) for every running sensor/schedule that failed since."""
     out = []
@@ -241,9 +256,7 @@ def alerting_tick_failure_watch(context: dg.SensorEvaluationContext):
     posting = env_flag("ALERTING_WATCHDOG_POSTING", default=True)
 
     for instigator, ticks in failing_instigators(context.instance, since):
-        error = ticks[0].error
-        cls = ((getattr(error, "cls_name", None) or "").rsplit(".", 1)[-1]) or "Error"
-        first = ((getattr(error, "message", None) or "").strip().splitlines() or ["tick failed"])[0]
+        cls, first = innermost_error(ticks[0].error)
         key = f"{instigator.instigator_name}|{cls}"
         if now - alerted.get(key, 0.0) <= _REALERT:
             continue

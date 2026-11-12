@@ -270,7 +270,12 @@ def test_tick_watch_posts_failing_instigators_and_start_timeout_storms(monkeypat
         is_running=True, selector_id="sel", instigator_origin_id="oid", origin=None,
         instigator_name="mpc_designation_lookup_schedule", instigator_type=InstigatorType.SCHEDULE,
     )
-    tick = SimpleNamespace(error=SerializableErrorInfo("KeyError: 'MPC_DB'", [], "KeyError"))
+    wrapper = "dagster._core.errors.SensorExecutionError"
+    tick = SimpleNamespace(error=SerializableErrorInfo(
+        f"{wrapper}: Error occurred during the execution of evaluation_fn", [], wrapper,
+        cause=SerializableErrorInfo("KeyError: 'MPC_DB'", [], "KeyError"),
+    ))
+    assert sensors.innermost_error(tick.error) == ("KeyError", "'MPC_DB'")
     failures = [SimpleNamespace(dagster_run=SimpleNamespace(run_id=f"r{i}", job_name="j", tags={}))
                 for i in range(3)]
     with dg.DagsterInstance.ephemeral() as instance:
