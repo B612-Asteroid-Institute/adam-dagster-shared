@@ -201,6 +201,27 @@ def test_watchdog_threshold_from_p95_and_flagging_window():
     assert flag(state, "run-1", age=33 * 3600, threshold=2 * 3600, now=now + 25 * 3600)
 
 
+def test_watchdog_baselines_per_asset_selection_and_skips_backfills(monkeypatch):
+    key_a = dg.AssetKey(["esa_risk_list"])
+    key_b = dg.AssetKey(["aims_frames_parquet"])
+    now = dt.datetime.now(dt.timezone.utc).timestamp()
+
+    def success(sel, seconds, i):
+        return SimpleNamespace(
+            dagster_run=SimpleNamespace(run_id=f"ok-{i}", job_name="__ASSET_JOB", tags={}, asset_selection=sel),
+            start_time=now - seconds - 10, end_time=now - 10,
+        )
+
+    successes = [success({key_a}, 60, i) for i in range(10)] + [success({key_b}, 4 * 3600, i + 10) for i in range(10)]
+    with dg.DagsterInstance.ephemeral() as instance:
+        monkeypatch.setattr(instance, "get_run_records", lambda **kw: successes)
+        b = sensors._job_baselines(instance, "__ASSET_JOB")
+    assert b["by_sel"][sensors.selection_key(successes[0].dagster_run)] == 60
+    assert b["by_sel"][sensors.selection_key(successes[-1].dagster_run)] == 4 * 3600
+    assert sensors.hung_threshold(b["by_sel"][sensors.selection_key(successes[0].dagster_run)]) == 2 * 3600
+    assert sensors.selection_key(SimpleNamespace(asset_selection=None)) == ""
+
+
 def test_watchdog_can_see_oldest_run_during_more_than_200_started_runs(monkeypatch):
     now = dt.datetime.now(dt.timezone.utc)
     records = [
@@ -218,6 +239,13 @@ def test_watchdog_can_see_oldest_run_during_more_than_200_started_runs(monkeypat
             create_timestamp=now - dt.timedelta(days=3),
         )
     )
+    records.append(  # a backfill is human-driven and long by design: never flagged
+        SimpleNamespace(
+            dagster_run=SimpleNamespace(run_id="backfill", job_name="system", tags={"dagster/backfill": "x"}),
+            start_time=now.timestamp() - 3 * 86400,
+            create_timestamp=now - dt.timedelta(days=3),
+        )
+    )
 
     def get(*, filters, limit, **kw):
         if filters.statuses == [dg.DagsterRunStatus.SUCCESS]:
@@ -230,7 +258,7 @@ def test_watchdog_can_see_oldest_run_during_more_than_200_started_runs(monkeypat
         with dg.build_sensor_context(instance=instance) as ctx:
             sensors.alerting_hung_run_watchdog(ctx)
             state = json.loads(ctx.cursor)
-    assert "hung-oldest" in state["alerted"]
+    assert "hung-oldest" in state["alerted"] and "backfill" not in state["alerted"]
 
 
 def test_tick_watch_posts_failing_instigators_and_start_timeout_storms(monkeypatch):

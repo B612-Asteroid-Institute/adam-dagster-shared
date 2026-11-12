@@ -100,6 +100,20 @@ def test_handler_chains_excepthook_and_reports_uncaught_as_critical(monkeypatch,
     assert out[0]["message"].splitlines()[-1] == "-- severity: critical"  # renderer styles from this
     assert out[0]["serviceContext"]["service"] == "unit-test-ns/precovery-v2-shard"
     assert len(chained) == 1, "original excepthook must still run, once"
+    # log-then-raise: the crash joins the logger's group instead of minting "adam.uncaught"
+    try:
+        root.addHandler(ErrorReportingHandler())
+        try:
+            raise ValueError("already logged")
+        except ValueError as exc:
+            logging.getLogger("adam_jobs.shard").exception("publish failed")
+            assert er.already_reported(exc)
+            sys.excepthook(*sys.exc_info())
+    finally:
+        root.handlers = before
+    out = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+    assert [o["message"].split(":")[0] for o in out] == ["ValueError in adam_jobs.shard"] * 2
+    assert out[1]["severity"] == "CRITICAL"
 
 
 def test_request_records_group_by_normalized_route(monkeypatch, capsys):

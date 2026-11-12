@@ -6,9 +6,10 @@ Everything here happens outside run pods, where no log handler can see it.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
-from collections import Counter
+from collections import Counter, defaultdict
 
 import dagster as dg
 from dagster import DagsterRunStatus, RunsFilter
@@ -26,7 +27,8 @@ _NO_HISTORY_SECONDS = 6 * 3600
 _P95_FACTOR = 3.0
 _BASELINE_TTL = 24 * 3600
 _REALERT = 24 * 3600
-_BASELINE_SAMPLE = 200  # recent successes per job
+_BASELINE_SAMPLE = 500  # recent successes per job
+_SELECTION_MIN_SAMPLES = 5  # below this, fall back to the job-wide p95
 _PAGE = 200
 _PAGE_CAP = 10  # at most 2000 STARTED runs per tick
 
@@ -91,21 +93,35 @@ def _fetch_started(instance) -> tuple[list, bool]:
     return records, False
 
 
-def _job_p95(instance, job: str) -> float | None:
+def selection_key(run) -> str:
+    """Asset-selection fingerprint: __ASSET_JOB hosts every automation run, whose durations
+    range from seconds (a risk-list fetch) to hours (a single-run backfill)."""
+    selection = getattr(run, "asset_selection", None)
+    if not selection:
+        return ""
+    names = sorted(getattr(k, "to_user_string", lambda: str(k))() for k in selection)
+    return hashlib.sha1("|".join(names).encode()).hexdigest()[:12]
+
+
+def _job_baselines(instance, job: str) -> dict:
+    """{"p95": job-wide p95 | None, "by_sel": {selection key: p95}} from recent successes."""
     try:
         successes = instance.get_run_records(
             filters=RunsFilter(statuses=[DagsterRunStatus.SUCCESS], job_name=job),
             limit=_BASELINE_SAMPLE,
         )
     except Exception:
-        return None
-    return p95_seconds(
-        [
-            r.end_time - r.start_time
-            for r in successes
-            if getattr(r, "start_time", None) and getattr(r, "end_time", None)
-        ]
-    )
+        return {"p95": None, "by_sel": {}}
+    durations: list[float] = []
+    by_sel: dict[str, list[float]] = defaultdict(list)
+    for r in successes:
+        if getattr(r, "start_time", None) and getattr(r, "end_time", None):
+            durations.append(r.end_time - r.start_time)
+            by_sel[selection_key(r.dagster_run)].append(r.end_time - r.start_time)
+    return {
+        "p95": p95_seconds(durations),
+        "by_sel": {k: p95_seconds(v) for k, v in by_sel.items() if k and len(v) >= _SELECTION_MIN_SAMPLES},
+    }
 
 
 @dg.sensor(
@@ -123,16 +139,19 @@ def alerting_hung_run_watchdog(context: dg.SensorEvaluationContext):
     started, complete = _fetch_started(context.instance)
     for record in started:
         run = record.dagster_run
+        if "dagster/backfill" in (run.tags or {}):
+            continue  # human-driven, watched, and hours long by design
         age = now - (getattr(record, "start_time", None) or record.create_timestamp.timestamp())
         baseline = baselines.get(run.job_name)
-        if baseline is None or now - baseline["at"] > _BASELINE_TTL:
-            baseline = {"p95": _job_p95(context.instance, run.job_name), "at": now}
+        if baseline is None or now - baseline["at"] > _BASELINE_TTL or "by_sel" not in baseline:
+            baseline = {**_job_baselines(context.instance, run.job_name), "at": now}
             baselines[run.job_name] = baseline
-        if not watchdog_should_flag(state, run.run_id, age, hung_threshold(baseline["p95"]), now):
+        p95 = baseline["by_sel"].get(selection_key(run)) or baseline["p95"]
+        if not watchdog_should_flag(state, run.run_id, age, hung_threshold(p95), now):
             continue
         history = (
-            f"; p95 for this job is {baseline['p95'] / 60:.0f}m"
-            if baseline["p95"]
+            f"; p95 for this job/selection is {p95 / 60:.0f}m"
+            if p95
             else " (no duration history; 6h floor exceeded)"
         )
         user = (run.tags or {}).get("external-user")

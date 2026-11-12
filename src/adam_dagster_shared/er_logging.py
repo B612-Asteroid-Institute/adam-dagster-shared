@@ -110,6 +110,24 @@ def write_entry(
     sys.stdout.flush()
 
 
+_REPORTED_ATTR = "_adam_er_logger"
+
+
+def mark_reported(exc: BaseException | None, logger_name: str) -> None:
+    """Remember which logger reported this exception, so a later re-raise joins that group."""
+    try:
+        if exc is not None and not getattr(exc, _REPORTED_ATTR, None):
+            setattr(exc, _REPORTED_ATTR, logger_name)
+    except Exception:  # noqa: BLE001 - some exception types reject attributes
+        pass
+
+
+def already_reported(exc: BaseException | None) -> bool:
+    """True once a logger has emitted this exception; handlers that catch-and-convert use it
+    to avoid a second ER group for the same fault."""
+    return bool(getattr(exc, _REPORTED_ATTR, None))
+
+
 def _request_bits(record: logging.LogRecord) -> dict:
     """Request context from ``extra`` fields or a Django request; never touches the DB."""
     bits: dict = {}
@@ -150,10 +168,12 @@ class ErrorReportingHandler(logging.Handler):
         _chain_excepthook()
 
     def emit(self, record: logging.LogRecord) -> None:
+        exc_info = record.exc_info if record.exc_info and record.exc_info[0] else None
+        if exc_info is not None:
+            mark_reported(exc_info[1], record.name)
         if not env_flag("ER_LOGGING_ENABLED"):
             return
         try:
-            exc_info = record.exc_info if record.exc_info and record.exc_info[0] else None
             # django.request without exc_info is Django's "Internal Server Error: /path"
             # echo of an exception the application handler already reported.
             if record.name == "django.request" and exc_info is None:
@@ -211,7 +231,9 @@ _original_thread_excepthook = None
 def _excepthook(exc_type, exc, tb):
     try:
         if not issubclass(exc_type, KeyboardInterrupt):
-            logging.getLogger("adam.uncaught").critical(
+            # A log-then-raise crash keeps the logger's group instead of minting a second one.
+            name = getattr(exc, _REPORTED_ATTR, None) or "adam.uncaught"
+            logging.getLogger(name).critical(
                 "uncaught exception: %s", exc, exc_info=(exc_type, exc, tb)
             )
     except Exception:  # noqa: BLE001 - the hook must never mask the crash
