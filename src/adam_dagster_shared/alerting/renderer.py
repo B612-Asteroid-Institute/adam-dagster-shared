@@ -37,7 +37,7 @@ _POST_BUDGET_PER_TICK = 10
 _BOILERPLATE = re.compile(
     r"^(Execution of (step|run) .* (failed|canceled)\.?"
     r"|unhandled error executing entry .*"
-    r"|uncaught exception: .*"
+    r"|uncaught exception(?: in thread \S+)?: .*"
     r"|Unhandled exception during .*)$"
 )
 # "<ExceptionClass>: message" — the most diagnostic single line.

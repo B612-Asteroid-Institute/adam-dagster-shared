@@ -13,9 +13,13 @@ import logging
 import os
 import re
 import sys
+import threading
 import traceback
 
 _NAMESPACE_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+# Cloud Logging drops entries over 256 KB; the head carries the grouping key, the tail
+# the decisive exception and footer.
+_MAX_MESSAGE_CHARS = 60_000
 REPORTED_ERROR_TYPE = (
     "type.googleapis.com/google.devtools.clouderrorreporting.v1beta1.ReportedErrorEvent"
 )
@@ -71,6 +75,14 @@ def footer(*bits: str) -> str:
     return "\n-- " + " · ".join(kept) if kept else ""
 
 
+def bounded(message: str) -> str:
+    if len(message) <= _MAX_MESSAGE_CHARS:
+        return message
+    head, tail = _MAX_MESSAGE_CHARS * 2 // 3, _MAX_MESSAGE_CHARS // 3
+    cut = len(message) - head - tail
+    return f"{message[:head]}\n  ⋯ [{cut} chars truncated]\n{message[-tail:]}"
+
+
 def write_entry(
     message: str,
     critical: bool,
@@ -89,7 +101,7 @@ def write_entry(
     entry = {
         "@type": REPORTED_ERROR_TYPE,
         "severity": "CRITICAL" if critical else "ERROR",
-        "message": message,
+        "message": bounded(message),
         "serviceContext": service_context,
         "context": context,
         "logging.googleapis.com/labels": {"er_handler": "adam-alerting", **labels},
@@ -193,6 +205,7 @@ class ErrorReportingHandler(logging.Handler):
 
 
 _original_excepthook = None
+_original_thread_excepthook = None
 
 
 def _excepthook(exc_type, exc, tb):
@@ -207,8 +220,29 @@ def _excepthook(exc_type, exc, tb):
         _original_excepthook(exc_type, exc, tb)
 
 
+def _thread_excepthook(args) -> None:
+    """Threads bypass sys.excepthook; without this a crashed worker thread is silent."""
+    try:
+        if not issubclass(args.exc_type, (KeyboardInterrupt, SystemExit)):
+            logging.getLogger("adam.uncaught").critical(
+                "uncaught exception in thread %s: %s",
+                getattr(args.thread, "name", "?"),
+                args.exc_value,
+                exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+            )
+    except Exception:  # noqa: BLE001 - the hook must never mask the crash
+        pass
+    if _original_thread_excepthook is not None:
+        _original_thread_excepthook(args)
+
+
 def _chain_excepthook() -> None:
-    global _original_excepthook
-    if env_flag("ER_LOGGING_ENABLED") and sys.excepthook is not _excepthook:
+    global _original_excepthook, _original_thread_excepthook
+    if not env_flag("ER_LOGGING_ENABLED"):
+        return
+    if sys.excepthook is not _excepthook:
         _original_excepthook = sys.excepthook
         sys.excepthook = _excepthook
+    if threading.excepthook is not _thread_excepthook:
+        _original_thread_excepthook = threading.excepthook
+        threading.excepthook = _thread_excepthook

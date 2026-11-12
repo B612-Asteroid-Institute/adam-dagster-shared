@@ -18,6 +18,8 @@ from adam_dagster_shared.alerting import renderer, sensors
 from adam_dagster_shared.alerting import slack as slack_mod
 from adam_dagster_shared.alerting.classify import FailureContext, StepFailure, classify
 from adam_dagster_shared.alerting.er_log_handler import ErrorReportingHandler
+from dagster._core.definitions.run_request import InstigatorType
+from dagster._utils.error import SerializableErrorInfo
 from adam_dagster_shared.alerting.renderer import parse_reported_message, render_group_blocks
 
 K8S_DEATH_MSG = (
@@ -114,6 +116,8 @@ def tick(cursor=None):
             "quality-gate", False, None,
         ),
         (_ctx(run_failure=("CheckError", CRASH_RESUME_MSG)), "run-worker-crash", False, None),
+        (_ctx(run_failure=(None, "Run timed out due to taking longer than 1200 seconds to start.")),
+         "start-timeout", False, None),
         # The OOM marker wins over the generic k8s-death phrase it also matches.
         (_ctx(step_failures=[StepFailure("system", ["RuntimeError"], [OOM_MSG])]),
          "system-oom", False, None),
@@ -121,7 +125,8 @@ def tick(cursor=None):
          "user-job-failure", True, None),
         (_ctx(), "unknown", False, None),
     ],
-    ids=["k8s-death", "retry-unwrap", "quality-gate", "crash-resume", "oom-precedence", "external-user", "empty"],
+    ids=["k8s-death", "retry-unwrap", "quality-gate", "crash-resume", "start-timeout", "oom-precedence",
+         "external-user", "empty"],
 )
 def test_classify_captured_production_failures(ctx, klass, user_facing, exception_contains):
     v = classify(ctx)
@@ -228,6 +233,32 @@ def test_watchdog_can_see_oldest_run_during_more_than_200_started_runs(monkeypat
     assert "hung-oldest" in state["alerted"]
 
 
+def test_tick_watch_posts_failing_instigators_and_start_timeout_storms(monkeypatch):
+    posted = []
+    monkeypatch.setattr(sensors, "post_message", lambda log, text, blocks: posted.append(text) or True)
+    monkeypatch.setattr(sensors, "extract_failure_context", lambda instance, run: _ctx(
+        run_failure=(None, "Run timed out due to taking longer than 1200 seconds to start.")))
+    schedule = SimpleNamespace(
+        is_running=True, selector_id="sel", instigator_origin_id="oid", origin=None,
+        instigator_name="mpc_designation_lookup_schedule", instigator_type=InstigatorType.SCHEDULE,
+    )
+    tick = SimpleNamespace(error=SerializableErrorInfo("KeyError: 'MPC_DB'", [], "KeyError"))
+    failures = [SimpleNamespace(dagster_run=SimpleNamespace(run_id=f"r{i}", job_name="j", tags={}))
+                for i in range(3)]
+    with dg.DagsterInstance.ephemeral() as instance:
+        monkeypatch.setattr(instance, "all_instigator_state", lambda **kw: [schedule, SimpleNamespace(
+            is_running=False, selector_id="x", instigator_origin_id="y")])
+        monkeypatch.setattr(instance, "get_ticks", lambda *a, **kw: [tick])
+        monkeypatch.setattr(instance, "get_run_records", lambda **kw: failures)
+        with dg.build_sensor_context(instance=instance) as ctx:
+            sensors.alerting_tick_failure_watch(ctx)
+            cursor = ctx.cursor
+        assert posted == ["schedule failing: mpc_designation_lookup_schedule", "runs failing to start"]
+        with dg.build_sensor_context(instance=instance, cursor=cursor) as ctx:  # 24h re-alert window
+            sensors.alerting_tick_failure_watch(ctx)
+    assert len(posted) == 2
+
+
 # ===== Dagster log handler =====
 
 
@@ -238,7 +269,7 @@ def test_er_handler_strips_run_prefix_and_adds_footer(capsys):
         None, None,
     )
     rec.dagster_meta = {
-        "orig_message": "Execution of step \"aims_mpc_hot_archive\" failed.\nStep failed health check",
+        "orig_message": "partition worker failed: upstream input for 2026-09-16 changed while building",
         "run_id": "1728932c-6614-443a-a9d6-aa958bcd107e",
         "step_key": "aims_mpc_hot_archive",
         "job_name": "__ASSET_JOB",
@@ -246,10 +277,40 @@ def test_er_handler_strips_run_prefix_and_adds_footer(capsys):
     ErrorReportingHandler().emit(rec)
     entry = _entry(capsys)
     assert entry["@type"].endswith("ReportedErrorEvent") and entry["severity"] == "ERROR"
-    assert entry["message"].startswith("Execution of step")  # grouping tokens: no run-id prefix
+    assert entry["message"].startswith("partition worker failed")  # grouping tokens: no run-id prefix
     assert "run_id: 1728932c" in entry["message"]
     assert entry["context"]["reportLocation"]["functionName"] == "aims_mpc_hot_archive"
     assert entry["logging.googleapis.com/labels"]["dagster_run_id"].startswith("1728932c")
+
+
+def _dagster_record(message, event_type=None, error=None):
+    rec = logging.LogRecord("dagster", logging.ERROR, "x.py", 1, message, None, None)
+    rec.dagster_meta = {"orig_message": message, "run_id": "r1", "step_key": "s1", "job_name": "j"}
+    if event_type:
+        rec.dagster_event = SimpleNamespace(
+            event_type_value=event_type,
+            event_specific_data=SimpleNamespace(error=error, error_display_string=None),
+        )
+    return rec
+
+
+def test_er_handler_skips_infrastructure_deaths_but_keeps_run_worker_crashes(capsys):
+    interrupted = "dagster._core.errors.DagsterExecutionInterruptedError"
+    skipped = [
+        _dagster_record('Execution of step "s1" failed.', "STEP_FAILURE",
+                        SerializableErrorInfo(K8S_DEATH_MSG, [], None)),
+        _dagster_record('Execution of step "s1" failed.', "STEP_FAILURE",
+                        SerializableErrorInfo(interrupted, [], interrupted)),
+        _dagster_record("Dependencies for step s1 failed: ['s0']. Not executing."),
+        _dagster_record('Execution of run for "j" canceled.', "RUN_CANCELED"),
+        _dagster_record("Steps failed: ['s1'].", "RUN_FAILURE"),
+    ]
+    for rec in skipped:
+        ErrorReportingHandler().emit(rec)
+    assert capsys.readouterr().out == "", "digest-only classes must not reach Error Reporting"
+    crash = SerializableErrorInfo("Invariant failed.", [], "dagster_shared.check.functions.CheckError")
+    ErrorReportingHandler().emit(_dagster_record("Execution of run failed.", "RUN_FAILURE", crash))
+    assert _entry(capsys)["message"].startswith("CheckError in s1:")
 
 
 def test_er_handler_neutralizes_exc_info_and_never_raises(capsys):

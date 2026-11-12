@@ -7,6 +7,7 @@ so the "<Cls> in <logger>" / "<Cls> at <METHOD> /route>" headline IS the fingerp
 import json
 import logging
 import sys
+import threading
 
 import pytest
 
@@ -16,9 +17,9 @@ from adam_dagster_shared.er_logging import ErrorReportingHandler, normalize_path
 
 @pytest.fixture(autouse=True)
 def restore_excepthook():
-    before, before_original = sys.excepthook, er._original_excepthook
+    before = (sys.excepthook, er._original_excepthook, threading.excepthook, er._original_thread_excepthook)
     yield
-    sys.excepthook, er._original_excepthook = before, before_original
+    sys.excepthook, er._original_excepthook, threading.excepthook, er._original_thread_excepthook = before
 
 
 def _record(msg="boom", logger_name="adam_jobs.cutout_worker.loop", exc=None, **attrs):
@@ -127,3 +128,33 @@ def test_django_request_echo_is_skipped_unless_it_carries_an_exception(monkeypat
     assert _emit(monkeypatch, capsys, echo, service="adam-api") is None
     real = _record("Internal Server Error: /api/x", logger_name="django.request", exc=KeyError("boom"))
     assert _emit(monkeypatch, capsys, real, service="adam-api")["message"].startswith("KeyError in django.request:")
+
+
+def test_thread_crashes_report_critical_and_long_messages_stay_bounded(monkeypatch, capsys):
+    monkeypatch.setenv("ER_LOGGING_ENABLED", "true")
+    monkeypatch.setenv("GARDEN_NAMESPACE", "unit-test-ns")
+    monkeypatch.setenv("ER_SERVICE_NAME", "cutout-worker")
+    threading.excepthook = lambda args: None  # keep pytest's stderr clean
+    root = logging.getLogger()
+    before = list(root.handlers)
+
+    def crash():
+        raise RuntimeError("publisher thread died")
+
+    try:
+        root.addHandler(ErrorReportingHandler())
+        assert threading.excepthook is er._thread_excepthook
+        t = threading.Thread(target=crash, name="publisher")
+        t.start()
+        t.join()
+    finally:
+        root.handlers = before
+    out = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+    assert len(out) == 1 and out[0]["severity"] == "CRITICAL"
+    assert out[0]["message"].startswith("RuntimeError in adam.uncaught:")
+    assert "in thread publisher" in out[0]["message"]
+
+    big = "ValueError in run:\n" + "x" * 200_000 + "\n-- run_id: abc"
+    bounded = er.bounded(big)
+    assert len(bounded) < 61_000 and bounded.startswith("ValueError in run:") and bounded.endswith("-- run_id: abc")
+    assert "chars truncated" in bounded and er.bounded("short") == "short"

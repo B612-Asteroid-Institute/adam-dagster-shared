@@ -2,13 +2,13 @@
 
 Handlers (er_log_handler for Dagster, er_logging for services/workers) emit structured
 entries; ER groups them; the renderer posts one Slack card per NEW group; a daily
-digest and a hung-run watchdog cover the rest. Gated on ALERTING_ENABLED; dry-run
+digest, a hung-run watchdog and a daemon-side tick/start-timeout watch cover the rest. Gated on ALERTING_ENABLED; dry-run
 until ALERTING_SLACK_TOKEN_SECRET is set. See docs/ALERTING.md.
 """
 
 from .digest import alerting_daily_digest_job, alerting_daily_digest_schedule
 from .renderer import alerting_er_group_renderer
-from .sensors import alerting_hung_run_watchdog
+from .sensors import alerting_hung_run_watchdog, alerting_tick_failure_watch
 
 
 def alerting_definitions() -> dict:
@@ -19,5 +19,5 @@ def alerting_definitions() -> dict:
     return {
         "jobs": [alerting_daily_digest_job],
         "schedules": [alerting_daily_digest_schedule],
-        "sensors": [alerting_hung_run_watchdog, alerting_er_group_renderer],
+        "sensors": [alerting_hung_run_watchdog, alerting_er_group_renderer, alerting_tick_failure_watch],
     }

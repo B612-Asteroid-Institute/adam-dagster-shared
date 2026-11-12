@@ -36,7 +36,12 @@ class Verdict:
 _RETRY_WRAPPERS = {"RetryRequestedFromPolicy", "RetryRequested"}
 _K8S_DEATH_MARKERS = ("failed health check", "discovered failed kubernetes job")
 _OOM_MARKERS = ("oomkilled", "out of memory")
-_CRASH_RESUME_MARKERS = ("attempted to mark step", "dagsterk8sunrecoverableapierror")
+_CRASH_RESUME_MARKERS = (
+    "attempted to mark step",
+    "dagsterk8sunrecoverableapierror",
+    "surpassed the configured maximum",  # run monitoring gave up resuming a dead run worker
+)
+_START_TIMEOUT_MARKER = "seconds to start"  # run monitoring: the run pod never came up
 
 
 def _real_exception(sf: StepFailure) -> tuple[str | None, str]:
@@ -84,6 +89,12 @@ def classify(ctx: FailureContext) -> Verdict:
         return _verdict("code-error", steps[0])
     if ctx.run_failure is not None:  # run-level failure with no step failure
         cls, msg = ctx.run_failure
-        crash = any(m in f"{cls or ''} {msg}".lower() for m in _CRASH_RESUME_MARKERS)
-        return Verdict("run-worker-crash" if crash else "run-failure", exception=_display(cls, msg))
+        text = f"{cls or ''} {msg}".lower()
+        if _START_TIMEOUT_MARKER in text:
+            klass = "start-timeout"
+        elif any(m in text for m in _CRASH_RESUME_MARKERS):
+            klass = "run-worker-crash"
+        else:
+            klass = "run-failure"
+        return Verdict(klass, exception=_display(cls, msg))
     return Verdict("unknown")

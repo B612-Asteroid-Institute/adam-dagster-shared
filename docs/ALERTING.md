@@ -13,20 +13,34 @@ failures plus a cross-surface ER overview.
 
 | Surface | Wiring | Grouping key |
 |---|---|---|
-| Every Dagster code location | `alerting/er_log_handler.py`, attached instance-wide via the Helm chart's `pythonLogs.dagsterHandlerConfig` | (exception class, step) |
+| Every Dagster code location | `alerting/er_log_handler.py`, attached instance-wide via the Helm chart's `pythonLogs.dagsterHandlerConfig`; module loggers listed in `pythonLogs.managedPythonLoggers` flow through it too | (exception class, step) |
 | Django services (adam-api) | `er_logging.ErrorReportingHandler` on the root logger via settings LOGGING | (exception class, `METHOD /route/{id}`) |
 | Workers (adam-jobs) | `er_logging.ErrorReportingHandler` in `logging.basicConfig(handlers=[...])` | (exception class, logger name) |
 
 Constructing `er_logging.ErrorReportingHandler` also chains `sys.excepthook`, so an uncaught
 exception in a service or worker reports as CRITICAL.
 
-Not covered: SIGKILL/OOM terminations, non-Python containers, silently missing schedules.
+Deliberately not reported as cards (the daily digest counts them by class): spot
+preemption / node-drain interrupts (`DagsterExecutionInterruptedError`), step pods that
+vanished (`failed health check`: evicted, preempted or OOM-killed — Dagster cannot tell
+which), run cancels, and steps abandoned because an upstream step failed.
+
+Uncaught exceptions in worker threads report too (`threading.excepthook` is chained).
+Entries are bounded to 60k chars (head + tail) so Cloud Logging never drops them.
+
+Not covered: non-Python containers, schedules that are turned off, and the code
+server / daemon being down (see the dead-man's switch in the rollout notes).
 
 ## The Slack surface
 
 Exactly one code location (adam-etl) merges `alerting_definitions()` into its Definitions:
-the ER group renderer, the daily digest job+schedule and the hung-run watchdog. A second
-registrant would double-post.
+the ER group renderer, the daily digest job+schedule, the hung-run watchdog and the tick
+watch. A second registrant would double-post.
+
+The tick watch (`alerting_tick_failure_watch`, 10 min) covers what happens in the daemon
+rather than in a run pod: a sensor or schedule whose evaluation raises (one card per
+instigator and exception class, re-alerted daily) and runs that hit the run-start timeout
+(≥3 in an hour → one card per day). The digest classifies the latter as `start-timeout`.
 
 Renderer guarantees:
 
