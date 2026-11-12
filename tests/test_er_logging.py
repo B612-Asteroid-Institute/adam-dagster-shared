@@ -92,7 +92,7 @@ def test_handler_chains_excepthook_and_reports_uncaught_as_critical(monkeypatch,
         except RuntimeError:
             sys.excepthook(*sys.exc_info())
     finally:
-        root.handlers = before
+        root.handlers = list(before)  # a copy: addHandler() must not mutate `before`
     out = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
     assert len(out) == 1
     assert out[0]["severity"] == "CRITICAL"
@@ -110,7 +110,7 @@ def test_handler_chains_excepthook_and_reports_uncaught_as_critical(monkeypatch,
             assert er.already_reported(exc)
             sys.excepthook(*sys.exc_info())
     finally:
-        root.handlers = before
+        root.handlers = list(before)  # a copy: addHandler() must not mutate `before`
     out = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
     assert [o["message"].split(":")[0] for o in out] == ["ValueError in adam_jobs.shard"] * 2
     assert out[1]["severity"] == "CRITICAL"
@@ -162,9 +162,10 @@ def test_thread_crashes_report_critical_and_long_messages_stay_bounded(monkeypat
         t.start()
         t.join()
     finally:
-        root.handlers = before
+        root.handlers = list(before)  # a copy: addHandler() must not mutate `before`
     out = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
-    assert len(out) == 1 and out[0]["severity"] == "CRITICAL"
+    assert len(out) == 1, [o["message"].splitlines()[0] + " / " + o["logging.googleapis.com/labels"]["logger"] for o in out]
+    assert out[0]["severity"] == "CRITICAL"
     assert out[0]["message"].startswith("RuntimeError in adam.uncaught:")
     assert "in thread publisher" in out[0]["message"]
 
