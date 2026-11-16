@@ -27,6 +27,9 @@ REPORTED_ERROR_TYPE = (
 _ID_SEG = re.compile(
     r"^(\d+|[0-9a-fA-F]{16,}|[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})$"
 )
+# Capability tokens (secrets.token_urlsafe style: long, mixed case, digits). Sharing routes
+# are also redacted by position: /share/<slug>/<token>/...
+_TOKEN_SEG = re.compile(r"^(?=.*\d)(?=.*[A-Z])(?=.*[a-z])[A-Za-z0-9_-]{20,}$")
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -65,8 +68,22 @@ def neutralize_stack(text: str) -> str:
 
 
 def normalize_path(path: str) -> str:
-    """/jobs/<uuid>/results/42 -> /jobs/{id}/results/{id}."""
-    return "/".join("{id}" if _ID_SEG.match(seg) else seg for seg in path.split("/")) or "/"
+    """/jobs/<uuid>/results/42 -> /jobs/{id}/results/{id}; a sharing capability token (or any
+    token-shaped segment) -> {token}. Applied to every copy of the path the entry carries, so
+    a credential never reaches Error Reporting or a Slack card."""
+    segs = path.split("/")
+    out = []
+    for i, seg in enumerate(segs):
+        if _ID_SEG.match(seg):
+            out.append("{id}")
+        elif seg and (_TOKEN_SEG.match(seg) or (i >= 2 and segs[i - 2] == "share")):
+            out.append("{token}")
+        else:
+            out.append(seg)
+    return "/".join(out) or "/"
+
+
+redact_path = normalize_path
 
 
 def footer(*bits: str) -> str:
@@ -192,9 +209,14 @@ class ErrorReportingHandler(logging.Handler):
             if exc_cls:
                 where = f"at {route}" if route else f"in {record.name}"
                 message = f"{exc_cls} {where}:\n{message}"
+            raw_path, safe_path = req.get("path", ""), ""
+            if raw_path:
+                safe_path = normalize_path(raw_path)
+                if safe_path != raw_path:  # the message text quotes the raw path (api.api does)
+                    message = message.replace(raw_path, safe_path)
             critical = record.levelno >= logging.CRITICAL
             message += footer(
-                f"request: {req['method']} {req['path']}" if has_request else "",
+                f"request: {req['method']} {safe_path}" if has_request else "",
                 f"status: {req['status']}" if req.get("status") else "",
                 f"user: {req['user']}" if req.get("user") else "",
                 f"client: {req['remote_ip']}" if req.get("remote_ip") else "",
@@ -203,7 +225,7 @@ class ErrorReportingHandler(logging.Handler):
 
             http_request = None
             if req.get("method"):
-                http_request = {"method": req["method"], "url": req.get("path", "")}
+                http_request = {"method": req["method"], "url": safe_path}
                 if req.get("status", "").isdigit():
                     http_request["responseStatusCode"] = int(req["status"])
                 if req.get("user_agent"):
@@ -246,7 +268,9 @@ def _thread_excepthook(args) -> None:
     """Threads bypass sys.excepthook; without this a crashed worker thread is silent."""
     try:
         if not issubclass(args.exc_type, (KeyboardInterrupt, SystemExit)):
-            logging.getLogger("adam.uncaught").critical(
+            # Same rule as _excepthook: a log-then-raise keeps the logger's group.
+            name = getattr(args.exc_value, _REPORTED_ATTR, None) or "adam.uncaught"
+            logging.getLogger(name).critical(
                 "uncaught exception in thread %s: %s",
                 getattr(args.thread, "name", "?"),
                 args.exc_value,

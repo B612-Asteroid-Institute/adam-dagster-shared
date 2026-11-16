@@ -123,8 +123,17 @@ def test_request_records_group_by_normalized_route(monkeypatch, capsys):
     entry = _emit(monkeypatch, capsys, record, service="adam-api")
     assert entry["message"].startswith("ValueError at GET /v1/jobs/{id}:")
     assert entry["context"]["reportLocation"]["functionName"] == "GET /v1/jobs/{id}"
-    assert "-- request: GET /v1/jobs/9999 · status: 500" in entry["message"]
+    assert "-- request: GET /v1/jobs/{id} · status: 500" in entry["message"]
     assert entry["context"]["httpRequest"]["responseStatusCode"] == 500
+
+    token = "SyntheticShareToken_With-32CharsXX"  # secrets.token_urlsafe(24) shape
+    path = f"/api/share/precovery_v2/{token}/resources/"
+    record = _record(f"Unhandled exception during GET {path}: boom", logger_name="api.api",
+                     exc=ValueError("boom"), http_method="GET", http_path=path, http_status=500)
+    entry = _emit(monkeypatch, capsys, record, service="adam-api")
+    assert token not in json.dumps(entry), "a sharing capability token must never reach ER or Slack"
+    assert entry["context"]["httpRequest"]["url"] == "/api/share/precovery_v2/{token}/resources/"
+    assert normalize_path("/v1/refresh-tokens/AbC123xyz_9876543210-QwErTy/") == "/v1/refresh-tokens/{token}/"
 
 
 def test_security_records_group_per_class_not_per_probed_path(monkeypatch, capsys):
@@ -168,6 +177,23 @@ def test_thread_crashes_report_critical_and_long_messages_stay_bounded(monkeypat
     assert out[0]["severity"] == "CRITICAL"
     assert out[0]["message"].startswith("RuntimeError in adam.uncaught:")
     assert "in thread publisher" in out[0]["message"]
+
+    def log_then_crash():
+        try:
+            raise ValueError("library failed")
+        except ValueError:
+            logging.getLogger("adam_jobs.publisher").exception("publish failed")
+            raise
+
+    try:
+        root.addHandler(ErrorReportingHandler())
+        t = threading.Thread(target=log_then_crash, name="publisher-2")
+        t.start()
+        t.join()
+    finally:
+        root.handlers = list(before)
+    heads = [json.loads(line)["message"].splitlines()[0] for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+    assert heads == ["ValueError in adam_jobs.publisher:"] * 2, "a log-then-raise in a thread keeps the logger's group"
 
     big = "ValueError in run:\n" + "x" * 200_000 + "\n-- run_id: abc"
     bounded = er.bounded(big)

@@ -28,7 +28,8 @@ from .slack import (
 )
 
 _ER_BASE = "https://clouderrorreporting.googleapis.com/v1beta1"
-_ANNOUNCED_CAP = 500  # group ids kept in the cursor
+_ANNOUNCED_CAP = 2000  # safety cap on cursor size; active groups are pruned by scope, not count
+_OUTAGE_TICKS = 3  # consecutive ER-fetch failures (or all-posts-rejected ticks) before the tick fails
 _EXCERPT_BUDGET = 1800  # stack chars per card
 _PAGE_CAP = 10  # groupStats pages of 100 per fetch
 _POST_BUDGET_PER_TICK = 10
@@ -231,8 +232,17 @@ def alerting_er_group_renderer(context: dg.SensorEvaluationContext):
     try:
         stats, complete = _fetch_group_stats("PERIOD_1_WEEK")
     except Exception as exc:
-        context.log.warning(f"alerting renderer: groupStats fetch failed ({exc})")
+        failures = state["fetch_failures"] = int(state.get("fetch_failures", 0)) + 1
+        context.log.warning(f"alerting renderer: groupStats fetch failed ({exc}); {failures} in a row")
+        if failures >= _OUTAGE_TICKS:
+            # A failed tick is visible: the tick watch posts it, and the daemon stops logging the
+            # heartbeat the dead-man's switch watches. Returning quietly would hide an ER outage.
+            raise RuntimeError(
+                f"alerting renderer: Error Reporting unreachable for {failures} ticks: {exc}"
+            ) from exc
+        context.update_cursor(json.dumps(state))
         return
+    state["fetch_failures"] = 0
     in_scope = _in_scope(stats, namespace)
 
     if not state["initialized"]:
@@ -254,15 +264,15 @@ def alerting_er_group_renderer(context: dg.SensorEvaluationContext):
         for group_id in [gid for gid in pending if gid not in in_scope]:
             del pending[group_id]
 
-    delivered = 0
+    attempted = accepted = 0
     for group_id in sorted(pending, key=pending.get):
         if group_id not in in_scope:
             continue
-        if delivered >= _POST_BUDGET_PER_TICK:
+        if attempted >= _POST_BUDGET_PER_TICK:
             context.log.info(f"alerting renderer: post budget reached; {len(pending)} still pending")
             break
         g, service = in_scope[group_id]
-        delivered += 1
+        attempted += 1
         try:
             # Sample from this namespace's service: a group shared with another
             # environment must not show that environment's traceback.
@@ -277,6 +287,7 @@ def alerting_er_group_renderer(context: dg.SensorEvaluationContext):
             ).get("errorEvents", [])
             fallback, blocks = render_group_blocks(g, events[0] if events else {}, namespace, service)
             if post_message(context.log, fallback, blocks):
+                accepted += 1
                 announced[group_id] = now
                 del pending[group_id]
                 context.log.info(f"alerting renderer: announced group {group_id} posted=True")
@@ -285,6 +296,16 @@ def alerting_er_group_renderer(context: dg.SensorEvaluationContext):
         except Exception as exc:
             context.log.warning(f"alerting renderer: group {group_id} failed ({exc}); kept pending")
 
-    for gid in sorted(announced, key=announced.get)[: max(0, len(announced) - _ANNOUNCED_CAP)]:
-        del announced[gid]
+    if complete:  # a group gone from the weekly window is forgotten; if it recurs, that is news
+        for gid in [g for g in announced if g not in in_scope]:
+            del announced[gid]
+    elif len(announced) > _ANNOUNCED_CAP:  # page-capped scan: absent-from-page ids go first
+        for gid in sorted(announced, key=lambda g: (g in in_scope, announced[g]))[
+            : len(announced) - _ANNOUNCED_CAP
+        ]:
+            del announced[gid]
+    rejected = int(state.get("delivery_failures", 0)) + 1 if attempted and not accepted else 0
+    state["delivery_failures"] = rejected
     context.update_cursor(json.dumps(state))
+    if rejected >= _OUTAGE_TICKS:  # same visibility rule as the fetch: the tick fails
+        raise RuntimeError(f"alerting renderer: Slack rejected every post for {rejected} ticks")

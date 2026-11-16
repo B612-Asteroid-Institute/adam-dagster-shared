@@ -12,14 +12,19 @@ import os
 from collections import Counter, defaultdict
 
 import dagster as dg
-from dagster import DagsterRunStatus, RunsFilter
+from dagster import (
+    DagsterEventType,
+    DagsterRunStatus,
+    RunsFilter,
+    RunStatusChangeRecordsFilter,
+)
 from dagster._core.definitions.run_request import InstigatorType
 from dagster._core.scheduler.instigation import TickStatus
 
 from adam_dagster_shared.er_logging import current_namespace, env_flag
 
-from .classify import classify
-from .extract import extract_failure_context
+from .classify import FailureContext, classify
+from .extract import run_failure_of
 from .slack import actions_block, env_prefix, link_button, post_message, section
 
 _FLOOR_SECONDS = 2 * 3600
@@ -59,15 +64,11 @@ def hung_threshold(p95: float | None) -> float:
     return max(_FLOOR_SECONDS, _P95_FACTOR * p95)
 
 
-def watchdog_should_flag(state: dict, run_id: str, age: float, threshold: float, now: float) -> bool:
-    """Record and return whether the run newly exceeds its threshold (re-alerts after 24h).
-
-    Deliberately independent of Slack posting so verdicts are still logged with posting off.
-    """
-    if age <= threshold or now - state["alerted"].get(run_id, 0.0) <= _REALERT:
-        return False
-    state["alerted"][run_id] = now
-    return True
+def watchdog_due(state: dict, run_id: str, age: float, threshold: float, now: float) -> bool:
+    """Whether the run exceeds its threshold and was not alerted in the last 24h. The caller
+    records ``state["alerted"][run_id]`` only once Slack accepted the post (or posting is off),
+    so a rejected post is retried next tick instead of silenced for a day."""
+    return age > threshold and now - state["alerted"].get(run_id, 0.0) > _REALERT
 
 
 def _fetch_started(instance) -> tuple[list, bool]:
@@ -147,7 +148,7 @@ def alerting_hung_run_watchdog(context: dg.SensorEvaluationContext):
             baseline = {**_job_baselines(context.instance, run.job_name), "at": now}
             baselines[run.job_name] = baseline
         p95 = baseline["by_sel"].get(selection_key(run)) or baseline["p95"]
-        if not watchdog_should_flag(state, run.run_id, age, hung_threshold(p95), now):
+        if not watchdog_due(state, run.run_id, age, hung_threshold(p95), now):
             continue
         history = (
             f"; p95 for this job/selection is {p95 / 60:.0f}m"
@@ -160,8 +161,10 @@ def alerting_hung_run_watchdog(context: dg.SensorEvaluationContext):
             f"STARTED {age / 3600:.1f}h ago{history}" + (f" · user {user}" if user else "")
         )
         context.log.info(f"alerting watchdog verdict: {text}")
-        if env_flag("ALERTING_WATCHDOG_POSTING", default=True):
-            post_message(context.log, f"hung run: {run.job_name} {run.run_id[:8]}", [section(text)])
+        if not env_flag("ALERTING_WATCHDOG_POSTING", default=True) or post_message(
+            context.log, f"hung run: {run.job_name} {run.run_id[:8]}", [section(text)]
+        ):
+            state["alerted"][run.run_id] = now
 
     if complete:  # an unscanned run has not necessarily finished
         live = {r.dagster_run.run_id for r in started}
@@ -169,11 +172,13 @@ def alerting_hung_run_watchdog(context: dg.SensorEvaluationContext):
     context.update_cursor(json.dumps(state))
 
 
-# ===== Tick failures and start timeouts =====
+# ===== Tick failures and daemon-side run failures =====
 
 _TICK_LOOKBACK = 3600  # first tick (or a lost cursor) looks back this far
 _TICK_OVERLAP = 300  # ticks that began before the last scan but failed after it
 _START_TIMEOUT_STORM = 3  # failed-to-start runs per hour before a post
+_FAILURE_SCAN_LIMIT = 500  # RUN_FAILURE events examined per tick (one event-log query)
+_LOST_RUNS_LISTED = 3  # run ids quoted in a card
 
 
 def _instigator_url(state, dagster_url: str) -> str:
@@ -221,22 +226,43 @@ def failing_instigators(instance, since: float) -> list[tuple]:
     return out
 
 
-def start_timeout_storm(instance, now: float) -> list[str]:
-    """Job names of runs that hit the run-start timeout in the last hour (empty below the storm size)."""
-    since = datetime.datetime.fromtimestamp(now - 3600, datetime.timezone.utc)
-    recent = instance.get_run_records(
-        filters=RunsFilter(statuses=[DagsterRunStatus.FAILURE], updated_after=since), limit=200
+def unbridged_run_failures(instance, since: float) -> tuple[list[dict], bool]:
+    """RUN_FAILURE events the daemon stored directly, newest first: run-start timeouts, run
+    workers lost after every resume attempt, max-runtime kills, launch failures. The daemon
+    logs them at INFO and they never pass a log handler, so this is their only path to a card.
+    Excluded: the run worker's "Steps failed: [...]" summary and failures that carry an
+    exception, which the Dagster-side handler already reported. Returns (failures, complete)."""
+    result = instance.fetch_run_status_changes(
+        RunStatusChangeRecordsFilter(
+            event_type=DagsterEventType.RUN_FAILURE, after_timestamp=float(since)
+        ),
+        limit=_FAILURE_SCAN_LIMIT,
     )
-    if len(recent) < _START_TIMEOUT_STORM:
-        return []
-    stalled = []
-    for record in recent[:100]:
+    out: list[dict] = []
+    for record in result.records:
         try:
-            if classify(extract_failure_context(instance, record.dagster_run)).klass == "start-timeout":
-                stalled.append(record.dagster_run.job_name)
+            entry = record.event_log_entry
+            evt = entry.dagster_event
+            data = evt.event_specific_data
+            if getattr(data, "error", None) is not None:
+                continue
+            if getattr(getattr(data, "failure_reason", None), "value", None) == "STEP_FAILURE":
+                continue
+            run_failure = run_failure_of(evt) or (None, "")
+            job = entry.job_name or evt.job_name or ""
+            ctx = FailureContext(run_id=entry.run_id, job_name=job, tags={}, run_failure=run_failure)
+            out.append(
+                {
+                    "run_id": entry.run_id,
+                    "job": job,
+                    "klass": classify(ctx).klass,
+                    "message": (run_failure[1].splitlines() or [""])[0],
+                    "ts": entry.timestamp,
+                }
+            )
         except Exception:
             continue
-    return stalled if len(stalled) >= _START_TIMEOUT_STORM else []
+    return out, not result.has_more
 
 
 @dg.sensor(
@@ -245,22 +271,38 @@ def start_timeout_storm(instance, now: float) -> list[str]:
     default_status=enabled_status(),
 )
 def alerting_tick_failure_watch(context: dg.SensorEvaluationContext):
-    """A sensor or schedule that errors every tick silently stops launching work; a run
-    that never starts (image pull, scheduling, node capacity) never runs a log handler."""
+    """What happens in the daemon, where no run-pod log handler can see it: a sensor or
+    schedule that errors every tick silently stops launching work; a run that never starts
+    (image pull, scheduling, node capacity) or loses its run worker never runs a handler."""
     now = datetime.datetime.now(datetime.timezone.utc).timestamp()
     state = load_cursor(context.cursor)
     alerted = state.setdefault("alerted", {})
-    since = float(state.get("since") or (now - _TICK_LOOKBACK)) - _TICK_OVERLAP
+    last_scan = float(state.get("since") or (now - _TICK_LOOKBACK))
+    since = last_scan - _TICK_OVERLAP
     namespace = current_namespace()
     dagster_url = os.environ.get("ALERTING_DAGSTER_URL", "").strip()
     posting = env_flag("ALERTING_WATCHDOG_POSTING", default=True)
+    rejected = 0
+
+    def deliver(keys: list[str], fallback: str, text: str, button: tuple[str, str]) -> None:
+        """Log the verdict and post it; suppress re-alerts only once Slack accepted the post
+        (or posting is off). A rejected post is retried next tick, not silenced for a day."""
+        nonlocal rejected
+        context.log.info(f"alerting tick watch verdict: {text}")
+        blocks = [section(text)]
+        if dagster_url:
+            blocks.append(actions_block([link_button(button[0], button[1])]))
+        if posting and not post_message(context.log, fallback, blocks):
+            rejected += 1
+            return
+        for key in keys:
+            alerted[key] = now
 
     for instigator, ticks in failing_instigators(context.instance, since):
         cls, first = innermost_error(ticks[0].error)
         key = f"{instigator.instigator_name}|{cls}"
         if now - alerted.get(key, 0.0) <= _REALERT:
             continue
-        alerted[key] = now
         kind = instigator.instigator_type.value.lower().replace("_", "-")
         plural = "s" if len(ticks) != 1 else ""
         text = (
@@ -268,29 +310,52 @@ def alerting_tick_failure_watch(context: dg.SensorEvaluationContext):
             f"*{instigator.instigator_name}* · {len(ticks)} failed tick{plural} since the last scan\n"
             f"> {cls}: {first[:300]}"
         )
-        context.log.info(f"alerting tick watch verdict: {text}")
-        blocks = [section(text)]
-        if dagster_url:
-            blocks.append(actions_block([link_button("Open in Dagster", _instigator_url(instigator, dagster_url))]))
-        if posting:
-            post_message(context.log, f"{kind} failing: {instigator.instigator_name}", blocks)
+        deliver(
+            [key],
+            f"{kind} failing: {instigator.instigator_name}",
+            text,
+            ("Open in Dagster", _instigator_url(instigator, dagster_url)),
+        )
 
-    if now - alerted.get("start-timeout", 0.0) > _REALERT:
-        stalled = start_timeout_storm(context.instance, now)
-        if stalled:
-            alerted["start-timeout"] = now
-            top = ", ".join(f"`{job}` ×{n}" for job, n in Counter(stalled).most_common(3))
-            text = (
-                f"🟠 *{env_prefix(namespace)}Runs failing to start* — {len(stalled)} runs in the last hour "
-                f"hit the run-start timeout before any step ran (image pull, scheduling or node capacity): {top}"
-            )
-            context.log.info(f"alerting tick watch verdict: {text}")
-            blocks = [section(text)]
-            if dagster_url:
-                blocks.append(actions_block([link_button("Open runs in Dagster", f"{dagster_url}/runs")]))
-            if posting:
-                post_message(context.log, "runs failing to start", blocks)
+    failures, complete = unbridged_run_failures(context.instance, now - 3600)
+    if not complete:
+        context.log.warning(
+            f"alerting tick watch: over {_FAILURE_SCAN_LIMIT} daemon-side run failures in the "
+            "last hour; only the newest were scanned"
+        )
+
+    stalled = [f["job"] for f in failures if f["klass"] == "start-timeout"]
+    if len(stalled) >= _START_TIMEOUT_STORM and now - alerted.get("start-timeout", 0.0) > _REALERT:
+        top = ", ".join(f"`{job}` ×{n}" for job, n in Counter(stalled).most_common(3))
+        text = (
+            f"🟠 *{env_prefix(namespace)}Runs failing to start* — {len(stalled)} runs in the last hour "
+            f"hit the run-start timeout before any step ran (image pull, scheduling or node capacity): {top}"
+        )
+        deliver(["start-timeout"], "runs failing to start", text, ("Open runs in Dagster", f"{dagster_url}/runs"))
+
+    lost = [
+        f
+        for f in failures
+        if f["klass"] != "start-timeout"
+        and f["ts"] > since
+        and now - alerted.get(f"run|{f['run_id']}", 0.0) > _REALERT
+    ]
+    if lost:
+        top = ", ".join(f"`{job}` ×{n}" for job, n in Counter(f["job"] for f in lost).most_common(3))
+        ids = ", ".join(f"`{f['run_id'][:8]}`" for f in lost[:_LOST_RUNS_LISTED])
+        plural = "s" if len(lost) != 1 else ""
+        text = (
+            f"🟠 *{env_prefix(namespace)}Run{plural} failed outside the run worker* — {len(lost)} run{plural} "
+            "since the last scan (worker lost after its resume attempts, max runtime exceeded, or launch "
+            f"failed; no step reported it): {top} · {ids}\n> {lost[0]['message'][:300]}"
+        )
+        deliver(
+            [f"run|{f['run_id']}" for f in lost],
+            "runs failed outside the run worker",
+            text,
+            ("Open runs in Dagster", f"{dagster_url}/runs"),
+        )
 
     state["alerted"] = {k: v for k, v in alerted.items() if now - v <= 2 * _REALERT}
-    state["since"] = now
+    state["since"] = last_scan if rejected else now  # a rejected post keeps the window open
     context.update_cursor(json.dumps(state))

@@ -27,6 +27,16 @@ def _walk_error_chain(error) -> tuple[list[str], list[str]]:
     return cls_chain, msg_chain
 
 
+def run_failure_of(evt) -> tuple[str | None, str] | None:
+    """(innermost class, message) of a RUN_FAILURE event, or None when it carries neither."""
+    error = getattr(getattr(evt, "event_specific_data", None), "error", None)
+    if error is not None:
+        cls_chain, msg_chain = _walk_error_chain(error)
+        return (cls_chain[-1] if cls_chain else None, msg_chain[-1] if msg_chain else "")
+    message = (getattr(evt, "message", None) or "").strip()
+    return (None, message) if message else None
+
+
 def extract_failure_context(instance, run) -> FailureContext:
     ctx = FailureContext(
         run_id=run.run_id,
@@ -56,14 +66,7 @@ def extract_failure_context(instance, run) -> FailureContext:
                     cls_chain = cls_chain or [""]
                 ctx.step_failures.append(StepFailure(evt.step_key or "", cls_chain, msg_chain))
             elif evt.event_type == DagsterEventType.RUN_FAILURE and ctx.run_failure is None:
-                if error is not None:
-                    cls_chain, msg_chain = _walk_error_chain(error)
-                    ctx.run_failure = (
-                        cls_chain[-1] if cls_chain else None,
-                        msg_chain[-1] if msg_chain else "",
-                    )
-                elif evt.message:
-                    ctx.run_failure = (None, evt.message.strip())
+                ctx.run_failure = run_failure_of(evt)
         except Exception:
             continue
     return ctx

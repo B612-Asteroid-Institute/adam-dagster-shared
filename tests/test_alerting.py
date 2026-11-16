@@ -4,8 +4,8 @@ Failure payloads are captured from production (2026-08); the renderer tests stub
 and Slack at module boundaries; the last test runs a real ephemeral Dagster instance.
 """
 
-import datetime as dt
 import datetime
+import datetime as dt
 import json
 import logging
 import sys
@@ -13,14 +13,18 @@ from types import SimpleNamespace
 
 import dagster as dg
 import pytest
+from dagster._core.definitions.run_request import InstigatorType
+from dagster._core.events import JobFailureData, RunFailureReason
+from dagster._utils.error import SerializableErrorInfo
 
 from adam_dagster_shared.alerting import renderer, sensors
 from adam_dagster_shared.alerting import slack as slack_mod
 from adam_dagster_shared.alerting.classify import FailureContext, StepFailure, classify
 from adam_dagster_shared.alerting.er_log_handler import ErrorReportingHandler
-from dagster._core.definitions.run_request import InstigatorType
-from dagster._utils.error import SerializableErrorInfo
-from adam_dagster_shared.alerting.renderer import parse_reported_message, render_group_blocks
+from adam_dagster_shared.alerting.renderer import (
+    parse_reported_message,
+    render_group_blocks,
+)
 
 K8S_DEATH_MSG = (
     "Step aims_observation_index_shards failed health check: Discovered failed "
@@ -192,13 +196,14 @@ def test_watchdog_threshold_from_p95_and_flagging_window():
     assert sensors.hung_threshold(30 * 60) == 2 * 3600  # floor
     assert sensors.hung_threshold(None) == 6 * 3600  # no history
 
-    flag = sensors.watchdog_should_flag
+    due = sensors.watchdog_due
     state = {"alerted": {}}
     now = 1_000_000.0
-    assert not flag(state, "run-1", age=3600, threshold=2 * 3600, now=now) and state["alerted"] == {}
-    assert flag(state, "run-1", age=8 * 3600, threshold=2 * 3600, now=now)
-    assert not flag(state, "run-1", age=9 * 3600, threshold=2 * 3600, now=now + 600)  # re-alert window
-    assert flag(state, "run-1", age=33 * 3600, threshold=2 * 3600, now=now + 25 * 3600)
+    assert not due(state, "run-1", age=3600, threshold=2 * 3600, now=now)
+    assert due(state, "run-1", age=8 * 3600, threshold=2 * 3600, now=now) and state["alerted"] == {}  # pure
+    state["alerted"]["run-1"] = now  # the sensor records this only once Slack accepted the post
+    assert not due(state, "run-1", age=9 * 3600, threshold=2 * 3600, now=now + 600)  # re-alert window
+    assert due(state, "run-1", age=33 * 3600, threshold=2 * 3600, now=now + 25 * 3600)
 
 
 def test_watchdog_baselines_per_asset_selection_and_skips_backfills(monkeypatch):
@@ -260,12 +265,24 @@ def test_watchdog_can_see_oldest_run_during_more_than_200_started_runs(monkeypat
             state = json.loads(ctx.cursor)
     assert "hung-oldest" in state["alerted"] and "backfill" not in state["alerted"]
 
+    attempts = []
+    monkeypatch.setenv("ALERTING_WATCHDOG_POSTING", "true")
+    monkeypatch.setattr(sensors, "post_message", lambda *a: attempts.append(a) or len(attempts) > 1)
+    with dg.DagsterInstance.ephemeral() as instance:
+        monkeypatch.setattr(instance, "get_run_records", get)
+        with dg.build_sensor_context(instance=instance) as ctx:
+            sensors.alerting_hung_run_watchdog(ctx)  # Slack rejects the post: not suppressed for a day
+            assert "hung-oldest" not in json.loads(ctx.cursor)["alerted"]
+            cursor = ctx.cursor
+        with dg.build_sensor_context(instance=instance, cursor=cursor) as ctx:
+            sensors.alerting_hung_run_watchdog(ctx)  # retried and accepted
+            assert "hung-oldest" in json.loads(ctx.cursor)["alerted"]
+    assert len(attempts) == 2
 
-def test_tick_watch_posts_failing_instigators_and_start_timeout_storms(monkeypatch):
-    posted = []
-    monkeypatch.setattr(sensors, "post_message", lambda log, text, blocks: posted.append(text) or True)
-    monkeypatch.setattr(sensors, "extract_failure_context", lambda instance, run: _ctx(
-        run_failure=(None, "Run timed out due to taking longer than 1200 seconds to start.")))
+
+def test_tick_watch_posts_failing_instigators_and_daemon_side_run_failures(monkeypatch):
+    posted, accept = [], [True]
+    monkeypatch.setattr(sensors, "post_message", lambda log, text, blocks: posted.append(text) or accept[0])
     schedule = SimpleNamespace(
         is_running=True, selector_id="sel", instigator_origin_id="oid", origin=None,
         instigator_name="mpc_designation_lookup_schedule", instigator_type=InstigatorType.SCHEDULE,
@@ -276,20 +293,51 @@ def test_tick_watch_posts_failing_instigators_and_start_timeout_storms(monkeypat
         cause=SerializableErrorInfo("KeyError: 'MPC_DB'", [], "KeyError"),
     ))
     assert sensors.innermost_error(tick.error) == ("KeyError", "'MPC_DB'")
-    failures = [SimpleNamespace(dagster_run=SimpleNamespace(run_id=f"r{i}", job_name="j", tags={}))
-                for i in range(3)]
+
+    @dg.op
+    def boom():
+        raise ValueError("a step failure: the handler already carded it")
+
+    @dg.job
+    def failing_job():
+        boom()
+
     with dg.DagsterInstance.ephemeral() as instance:
         monkeypatch.setattr(instance, "all_instigator_state", lambda **kw: [schedule, SimpleNamespace(
             is_running=False, selector_id="x", instigator_origin_id="y")])
         monkeypatch.setattr(instance, "get_ticks", lambda *a, **kw: [tick])
-        monkeypatch.setattr(instance, "get_run_records", lambda **kw: failures)
+        failing_job.execute_in_process(instance=instance, raise_on_error=False)  # "Steps failed" summary: excluded
+        for i in range(3):  # the daemon marks runs failed without any log handler seeing it
+            run = instance.create_run_for_job(failing_job)
+            instance.report_run_failed(
+                run, "Run timed out due to taking longer than 1200 seconds to start.",
+                JobFailureData(error=None, failure_reason=RunFailureReason.START_TIMEOUT),
+            )
+        lost = instance.create_run_for_job(failing_job)
+        instance.report_run_failed(lost, (
+            "Detected run worker status FAILED. Marking run as failed, because it has "
+            "surpassed the configured maximum attempts to resume the run: 10."))
+        failures, complete = sensors.unbridged_run_failures(instance, since=0)
+        assert complete
+        assert sorted(f["klass"] for f in failures) == ["run-worker-crash"] + ["start-timeout"] * 3
+
+        accept[0] = False  # Slack down: nothing is suppressed and the scan window stays open
         with dg.build_sensor_context(instance=instance) as ctx:
             sensors.alerting_tick_failure_watch(ctx)
             cursor = ctx.cursor
-        assert posted == ["schedule failing: mpc_designation_lookup_schedule", "runs failing to start"]
+        assert len(posted) == 3 and json.loads(cursor)["alerted"] == {}
+        accept[0] = True
+        with dg.build_sensor_context(instance=instance, cursor=cursor) as ctx:
+            sensors.alerting_tick_failure_watch(ctx)
+            cursor = ctx.cursor
+        assert posted[3:] == [
+            "schedule failing: mpc_designation_lookup_schedule",
+            "runs failing to start",
+            "runs failed outside the run worker",
+        ]
         with dg.build_sensor_context(instance=instance, cursor=cursor) as ctx:  # 24h re-alert window
             sensors.alerting_tick_failure_watch(ctx)
-    assert len(posted) == 2
+    assert len(posted) == 6
 
 
 # ===== Dagster log handler =====
@@ -539,6 +587,38 @@ def test_renderer_has_per_tick_backpressure(monkeypatch):
     for _ in range(3):
         cursor = tick(cursor)
     assert len(posts) == 30, "overflow drains on later ticks, not dropped"
+
+
+def test_active_groups_above_the_cap_are_not_reannounced_and_outages_fail_the_tick(monkeypatch):
+    posts = []
+    many = [group(f"g{i}") for i in range(renderer._ANNOUNCED_CAP + 1)]
+    monkeypatch.setattr(
+        renderer, "_er_get",
+        lambda path, params: {"errorGroupStats": many} if path == "groupStats" else {"errorEvents": [event()]},
+    )
+    monkeypatch.setattr(renderer, "post_message", lambda *a: posts.append(a) or True)
+    cursor = tick()  # adopted silently
+    for _ in range(3):
+        cursor = tick(cursor)
+    assert posts == [], "an active group dropped from the cursor by a size cap gets re-announced"
+    assert len(json.loads(cursor)["announced"]) == renderer._ANNOUNCED_CAP + 1
+
+    def down(path, params):
+        raise TimeoutError("ER down")
+
+    monkeypatch.setattr(renderer, "_er_get", down)  # two quiet ticks, then the tick itself fails
+    cursor = tick(tick(cursor))
+    with pytest.raises(RuntimeError, match="unreachable for 3 ticks"):
+        tick(cursor)
+    monkeypatch.setattr(
+        renderer, "_er_get",
+        lambda path, params: {"errorGroupStats": many + [group("fresh")]} if path == "groupStats"
+        else {"errorEvents": [event()]},
+    )
+    monkeypatch.setattr(renderer, "post_message", lambda *a: False)  # Slack rejects everything
+    cursor = tick(tick(cursor))
+    with pytest.raises(RuntimeError, match="Slack rejected every post for 3 ticks"):
+        tick(cursor)
 
 
 # ===== Real Dagster: handler event path, extraction, digest sweep =====
