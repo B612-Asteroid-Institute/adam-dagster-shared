@@ -43,12 +43,6 @@ def _emit(monkeypatch, capsys, record, service="cutout-worker-ztf"):
     return json.loads(out) if out else None
 
 
-def test_disabled_without_env(monkeypatch, capsys):
-    monkeypatch.delenv("ER_LOGGING_ENABLED", raising=False)
-    ErrorReportingHandler().emit(_record())
-    assert capsys.readouterr().out == ""
-
-
 def test_headline_and_function_name_carry_the_grouping_key(monkeypatch, capsys):
     try:
         try:
@@ -66,13 +60,14 @@ def test_headline_and_function_name_carry_the_grouping_key(monkeypatch, capsys):
     assert entry["message"].count("Stack trace (most recent call last):") == 2
     assert "in test_headline_and_function_name_carry_the_grouping_key" in entry["message"]
 
-
-def test_never_raises_on_hostile_record(monkeypatch, capsys):
     class Hostile:
         def __str__(self):
             raise RuntimeError("hostile __str__")
 
-    assert _emit(monkeypatch, capsys, _record(msg=Hostile())) is None
+    assert _emit(monkeypatch, capsys, _record(msg=Hostile())) is None, "a handler never raises"
+    monkeypatch.delenv("ER_LOGGING_ENABLED")
+    ErrorReportingHandler().emit(_record())
+    assert capsys.readouterr().out == "", "inert without ER_LOGGING_ENABLED"
 
 
 def test_handler_chains_excepthook_and_reports_uncaught_as_critical(monkeypatch, capsys):
@@ -116,7 +111,7 @@ def test_handler_chains_excepthook_and_reports_uncaught_as_critical(monkeypatch,
     assert out[1]["severity"] == "CRITICAL"
 
 
-def test_request_records_group_by_normalized_route(monkeypatch, capsys):
+def test_request_records_group_by_route_redact_tokens_and_skip_django_echoes(monkeypatch, capsys):
     assert normalize_path("/v1/jobs/123e4567-e89b-12d3-a456-426614174000/results/42") == "/v1/jobs/{id}/results/{id}"
     record = _record("Unhandled exception during GET x: boom", logger_name="api.api",
                      exc=ValueError("boom"), http_method="GET", http_path="/v1/jobs/9999", http_status=500)
@@ -135,8 +130,7 @@ def test_request_records_group_by_normalized_route(monkeypatch, capsys):
     assert entry["context"]["httpRequest"]["url"] == "/api/share/precovery_v2/{token}/resources/"
     assert normalize_path("/v1/refresh-tokens/AbC123xyz_9876543210-QwErTy/") == "/v1/refresh-tokens/{token}/"
 
-
-def test_security_records_group_per_class_not_per_probed_path(monkeypatch, capsys):
+    # django.security: attacker-chosen paths must not mint one group per probe.
     record = _record("Invalid HTTP_HOST header.", logger_name="django.security.DisallowedHost",
                      exc=Exception("x"), http_method="GET", http_path="/boaform/admin/formLogin",
                      http_status=400)
@@ -144,8 +138,6 @@ def test_security_records_group_per_class_not_per_probed_path(monkeypatch, capsy
     assert entry["message"].startswith("Exception in django.security.DisallowedHost:")
     assert entry["context"]["reportLocation"]["functionName"] == "django.security.DisallowedHost"
 
-
-def test_django_request_echo_is_skipped_unless_it_carries_an_exception(monkeypatch, capsys):
     # Django's "Internal Server Error: /path" (no exc_info) duplicates the application record.
     echo = _record("Internal Server Error: /api/x", logger_name="django.request", status_code=500)
     assert _emit(monkeypatch, capsys, echo, service="adam-api") is None

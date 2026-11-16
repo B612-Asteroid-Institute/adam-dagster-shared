@@ -64,13 +64,6 @@ def hung_threshold(p95: float | None) -> float:
     return max(_FLOOR_SECONDS, _P95_FACTOR * p95)
 
 
-def watchdog_due(state: dict, run_id: str, age: float, threshold: float, now: float) -> bool:
-    """Whether the run exceeds its threshold and was not alerted in the last 24h. The caller
-    records ``state["alerted"][run_id]`` only once Slack accepted the post (or posting is off),
-    so a rejected post is retried next tick instead of silenced for a day."""
-    return age > threshold and now - state["alerted"].get(run_id, 0.0) > _REALERT
-
-
 def _fetch_started(instance) -> tuple[list, bool]:
     """STARTED runs oldest-first, paginated; returns (records, complete)."""
     records: list = []
@@ -148,7 +141,7 @@ def alerting_hung_run_watchdog(context: dg.SensorEvaluationContext):
             baseline = {**_job_baselines(context.instance, run.job_name), "at": now}
             baselines[run.job_name] = baseline
         p95 = baseline["by_sel"].get(selection_key(run)) or baseline["p95"]
-        if not watchdog_due(state, run.run_id, age, hung_threshold(p95), now):
+        if age <= hung_threshold(p95) or now - state["alerted"].get(run.run_id, 0.0) <= _REALERT:
             continue
         history = (
             f"; p95 for this job/selection is {p95 / 60:.0f}m"
@@ -161,6 +154,7 @@ def alerting_hung_run_watchdog(context: dg.SensorEvaluationContext):
             f"STARTED {age / 3600:.1f}h ago{history}" + (f" · user {user}" if user else "")
         )
         context.log.info(f"alerting watchdog verdict: {text}")
+        # Suppress for a day only once Slack accepted the post (or posting is off).
         if not env_flag("ALERTING_WATCHDOG_POSTING", default=True) or post_message(
             context.log, f"hung run: {run.job_name} {run.run_id[:8]}", [section(text)]
         ):

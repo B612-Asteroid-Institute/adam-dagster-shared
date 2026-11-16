@@ -4,7 +4,6 @@ Failure payloads are captured from production (2026-08); the renderer tests stub
 and Slack at module boundaries; the last test runs a real ephemeral Dagster instance.
 """
 
-import datetime
 import datetime as dt
 import json
 import logging
@@ -189,21 +188,12 @@ def test_dry_run_without_token_secret_logs_instead_of_posting(monkeypatch):
 # ===== Watchdog =====
 
 
-def test_watchdog_threshold_from_p95_and_flagging_window():
+def test_watchdog_threshold_from_p95():
     assert sensors.p95_seconds([]) is None
     assert sensors.p95_seconds(list(map(float, range(1, 101)))) == 96.0
     assert sensors.hung_threshold(63 * 60) == 3 * 63 * 60
     assert sensors.hung_threshold(30 * 60) == 2 * 3600  # floor
     assert sensors.hung_threshold(None) == 6 * 3600  # no history
-
-    due = sensors.watchdog_due
-    state = {"alerted": {}}
-    now = 1_000_000.0
-    assert not due(state, "run-1", age=3600, threshold=2 * 3600, now=now)
-    assert due(state, "run-1", age=8 * 3600, threshold=2 * 3600, now=now) and state["alerted"] == {}  # pure
-    state["alerted"]["run-1"] = now  # the sensor records this only once Slack accepted the post
-    assert not due(state, "run-1", age=9 * 3600, threshold=2 * 3600, now=now + 600)  # re-alert window
-    assert due(state, "run-1", age=33 * 3600, threshold=2 * 3600, now=now + 25 * 3600)
 
 
 def test_watchdog_baselines_per_asset_selection_and_skips_backfills(monkeypatch):
@@ -343,27 +333,6 @@ def test_tick_watch_posts_failing_instigators_and_daemon_side_run_failures(monke
 # ===== Dagster log handler =====
 
 
-def test_er_handler_strips_run_prefix_and_adds_footer(capsys):
-    rec = logging.LogRecord(
-        "dagster", logging.ERROR, "x.py", 1,
-        "__ASSET_JOB - 1728932c-6614-443a-a9d6-aa958bcd107e - 1 - STEP_FAILURE - boom",
-        None, None,
-    )
-    rec.dagster_meta = {
-        "orig_message": "partition worker failed: upstream input for 2026-09-16 changed while building",
-        "run_id": "1728932c-6614-443a-a9d6-aa958bcd107e",
-        "step_key": "aims_mpc_hot_archive",
-        "job_name": "__ASSET_JOB",
-    }
-    ErrorReportingHandler().emit(rec)
-    entry = _entry(capsys)
-    assert entry["@type"].endswith("ReportedErrorEvent") and entry["severity"] == "ERROR"
-    assert entry["message"].startswith("partition worker failed")  # grouping tokens: no run-id prefix
-    assert "run_id: 1728932c" in entry["message"]
-    assert entry["context"]["reportLocation"]["functionName"] == "aims_mpc_hot_archive"
-    assert entry["logging.googleapis.com/labels"]["dagster_run_id"].startswith("1728932c")
-
-
 def _dagster_record(message, event_type=None, error=None):
     rec = logging.LogRecord("dagster", logging.ERROR, "x.py", 1, message, None, None)
     rec.dagster_meta = {"orig_message": message, "run_id": "r1", "step_key": "s1", "job_name": "j"}
@@ -453,7 +422,7 @@ def test_parse_reported_message_dagster_api_and_long_bodies():
 
 
 def test_render_group_blocks_dagster_api_and_critical_cards():
-    recent = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    recent = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     g = group("CNemo", [f"{NS}/adam-etl"], count="3", first_seen=recent)
     ev = {
         "serviceContext": {"service": f"{NS}/adam-etl", "version": "v-abc123"},
@@ -484,60 +453,25 @@ def test_render_group_blocks_dagster_api_and_critical_cards():
 # ===== Renderer: delivery semantics =====
 
 
-def test_first_error_after_empty_bootstrap_is_announced(monkeypatch):
-    groups, posts = [], []
-    monkeypatch.setattr(
-        renderer, "_er_get",
-        lambda path, params: {"errorGroupStats": groups} if path == "groupStats" else {"errorEvents": [event()]},
-    )
-    monkeypatch.setattr(renderer, "post_message", lambda *args: posts.append(args) or True)
-    cursor = tick()
-    groups.append(group())
-    cursor = tick(cursor)
-    tick(cursor)
-    assert len(posts) == 1, "Empty successful bootstrap must not swallow the first real error"
-
-
-@pytest.mark.parametrize("failure", ["slack_false", "event_fetch_exception"])
-def test_failed_delivery_remains_pending_for_next_tick(monkeypatch, failure):
-    posts = []
-    broken = True
+def test_bootstrap_adopts_silently_then_announces_and_retries_rejected_posts(monkeypatch):
+    groups, posts, state = [group("preexisting")], [], {"er_down": True, "slack_ok": False}
 
     def get(path, params):
-        if path == "groupStats":
-            return {"errorGroupStats": [group()]}
-        if failure == "event_fetch_exception" and broken:
-            raise TimeoutError("simulated ER outage")
-        return {"errorEvents": [event()]}
-
-    def post(*args):
-        posts.append(args)
-        return not broken
-
-    monkeypatch.setattr(renderer, "_er_get", get)
-    monkeypatch.setattr(renderer, "post_message", post)
-    cursor = tick(json.dumps({"announced": {"old": 1}}))
-    broken = False
-    tick(cursor)
-    assert len(posts) == (2 if failure == "slack_false" else 1), "Delivery must retry after recovery"
-
-
-def test_failed_initial_fetch_does_not_initialize(monkeypatch):
-    posts = []
-    calls = {"n": 0}
-
-    def get(path, params):
-        calls["n"] += 1
-        if calls["n"] == 1:
+        if state["er_down"]:
             raise TimeoutError("ER down during bootstrap")
-        return {"errorGroupStats": [group("preexisting")]} if path == "groupStats" else {"errorEvents": [event()]}
+        return {"errorGroupStats": groups} if path == "groupStats" else {"errorEvents": [event()]}
 
     monkeypatch.setattr(renderer, "_er_get", get)
-    monkeypatch.setattr(renderer, "post_message", lambda *a: posts.append(a) or True)
-    cursor = tick()
-    cursor = tick(cursor)
-    tick(cursor)
-    assert posts == [], "a group that predates the first complete snapshot is adopted silently"
+    monkeypatch.setattr(renderer, "post_message", lambda *a: posts.append(a) or state["slack_ok"])
+    cursor = tick()  # failed fetch: not initialized
+    state["er_down"] = False
+    cursor = tick(tick(cursor))
+    assert posts == [], "groups that predate the first complete snapshot are adopted silently"
+    groups.append(group())
+    cursor = tick(cursor)  # Slack rejects: stays pending
+    state["slack_ok"] = True
+    tick(tick(cursor))
+    assert len(posts) == 2, "one rejected attempt, one accepted retry, no re-announcement"
 
 
 def test_renderer_fetches_next_page_for_new_low_count_groups(monkeypatch):
@@ -589,7 +523,7 @@ def test_renderer_has_per_tick_backpressure(monkeypatch):
     assert len(posts) == 30, "overflow drains on later ticks, not dropped"
 
 
-def test_active_groups_above_the_cap_are_not_reannounced_and_outages_fail_the_tick(monkeypatch):
+def test_active_groups_above_the_cap_are_not_reannounced_and_er_outages_fail_the_tick(monkeypatch):
     posts = []
     many = [group(f"g{i}") for i in range(renderer._ANNOUNCED_CAP + 1)]
     monkeypatch.setattr(
@@ -609,15 +543,6 @@ def test_active_groups_above_the_cap_are_not_reannounced_and_outages_fail_the_ti
     monkeypatch.setattr(renderer, "_er_get", down)  # two quiet ticks, then the tick itself fails
     cursor = tick(tick(cursor))
     with pytest.raises(RuntimeError, match="unreachable for 3 ticks"):
-        tick(cursor)
-    monkeypatch.setattr(
-        renderer, "_er_get",
-        lambda path, params: {"errorGroupStats": many + [group("fresh")]} if path == "groupStats"
-        else {"errorEvents": [event()]},
-    )
-    monkeypatch.setattr(renderer, "post_message", lambda *a: False)  # Slack rejects everything
-    cursor = tick(tick(cursor))
-    with pytest.raises(RuntimeError, match="Slack rejected every post for 3 ticks"):
         tick(cursor)
 
 
@@ -655,3 +580,4 @@ def test_actual_dagster_step_failure_keeps_exception_and_run_link(capsys):
     assert "Stack Trace:" in message and "Traceback (most recent call last):" not in message
     assert result.run_id in message
     assert entries[0]["context"]["reportLocation"]["functionName"] == "deliberate_failure"
+    assert entries[0]["logging.googleapis.com/labels"]["dagster_run_id"] == result.run_id

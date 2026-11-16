@@ -28,8 +28,8 @@ from .slack import (
 )
 
 _ER_BASE = "https://clouderrorreporting.googleapis.com/v1beta1"
-_ANNOUNCED_CAP = 2000  # safety cap on cursor size; active groups are pruned by scope, not count
-_OUTAGE_TICKS = 3  # consecutive ER-fetch failures (or all-posts-rejected ticks) before the tick fails
+_ANNOUNCED_CAP = 2000  # cursor safety cap, applied only when a scan is page-capped
+_OUTAGE_TICKS = 3  # consecutive failed ER fetches before the tick itself fails
 _EXCERPT_BUDGET = 1800  # stack chars per card
 _PAGE_CAP = 10  # groupStats pages of 100 per fetch
 _POST_BUDGET_PER_TICK = 10
@@ -264,7 +264,7 @@ def alerting_er_group_renderer(context: dg.SensorEvaluationContext):
         for group_id in [gid for gid in pending if gid not in in_scope]:
             del pending[group_id]
 
-    attempted = accepted = 0
+    attempted = 0
     for group_id in sorted(pending, key=pending.get):
         if group_id not in in_scope:
             continue
@@ -287,7 +287,6 @@ def alerting_er_group_renderer(context: dg.SensorEvaluationContext):
             ).get("errorEvents", [])
             fallback, blocks = render_group_blocks(g, events[0] if events else {}, namespace, service)
             if post_message(context.log, fallback, blocks):
-                accepted += 1
                 announced[group_id] = now
                 del pending[group_id]
                 context.log.info(f"alerting renderer: announced group {group_id} posted=True")
@@ -296,16 +295,9 @@ def alerting_er_group_renderer(context: dg.SensorEvaluationContext):
         except Exception as exc:
             context.log.warning(f"alerting renderer: group {group_id} failed ({exc}); kept pending")
 
-    if complete:  # a group gone from the weekly window is forgotten; if it recurs, that is news
+    # Forget groups gone from the weekly window (a recurrence is news). Never evict an active
+    # group by count: it would be re-announced on the next tick, forever.
+    if complete or len(announced) > _ANNOUNCED_CAP:
         for gid in [g for g in announced if g not in in_scope]:
             del announced[gid]
-    elif len(announced) > _ANNOUNCED_CAP:  # page-capped scan: absent-from-page ids go first
-        for gid in sorted(announced, key=lambda g: (g in in_scope, announced[g]))[
-            : len(announced) - _ANNOUNCED_CAP
-        ]:
-            del announced[gid]
-    rejected = int(state.get("delivery_failures", 0)) + 1 if attempted and not accepted else 0
-    state["delivery_failures"] = rejected
     context.update_cursor(json.dumps(state))
-    if rejected >= _OUTAGE_TICKS:  # same visibility rule as the fetch: the tick fails
-        raise RuntimeError(f"alerting renderer: Slack rejected every post for {rejected} ticks")

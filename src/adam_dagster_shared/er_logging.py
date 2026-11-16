@@ -83,8 +83,6 @@ def normalize_path(path: str) -> str:
     return "/".join(out) or "/"
 
 
-redact_path = normalize_path
-
 
 def footer(*bits: str) -> str:
     """Trailing "-- k: v · k: v" line: context that must not affect grouping."""
@@ -203,17 +201,16 @@ class ErrorReportingHandler(logging.Handler):
 
             req = _request_bits(record)
             has_request = bool(req.get("method") and req.get("path"))
-            route = f"{req['method']} {normalize_path(req['path'])}" if has_request else ""
+            raw_path = req.get("path", "")
+            safe_path = normalize_path(raw_path) if raw_path else ""
+            route = f"{req['method']} {safe_path}" if has_request else ""
             if record.name.startswith("django.security"):
                 route = ""  # attacker-chosen paths would mint one group per probe
             if exc_cls:
                 where = f"at {route}" if route else f"in {record.name}"
                 message = f"{exc_cls} {where}:\n{message}"
-            raw_path, safe_path = req.get("path", ""), ""
-            if raw_path:
-                safe_path = normalize_path(raw_path)
-                if safe_path != raw_path:  # the message text quotes the raw path (api.api does)
-                    message = message.replace(raw_path, safe_path)
+            if raw_path and safe_path != raw_path:  # the message text quotes the raw path
+                message = message.replace(raw_path, safe_path)
             critical = record.levelno >= logging.CRITICAL
             message += footer(
                 f"request: {req['method']} {safe_path}" if has_request else "",
@@ -250,34 +247,30 @@ _original_excepthook = None
 _original_thread_excepthook = None
 
 
-def _excepthook(exc_type, exc, tb):
+def _report_uncaught(exc_type, exc, tb, thread: str = "") -> None:
     try:
-        if not issubclass(exc_type, KeyboardInterrupt):
+        if not issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
             # A log-then-raise crash keeps the logger's group instead of minting a second one.
             name = getattr(exc, _REPORTED_ATTR, None) or "adam.uncaught"
+            where = f" in thread {thread}" if thread else ""
             logging.getLogger(name).critical(
-                "uncaught exception: %s", exc, exc_info=(exc_type, exc, tb)
+                "uncaught exception%s: %s", where, exc, exc_info=(exc_type, exc, tb)
             )
     except Exception:  # noqa: BLE001 - the hook must never mask the crash
         pass
+
+
+def _excepthook(exc_type, exc, tb):
+    _report_uncaught(exc_type, exc, tb)
     if _original_excepthook is not None:
         _original_excepthook(exc_type, exc, tb)
 
 
 def _thread_excepthook(args) -> None:
     """Threads bypass sys.excepthook; without this a crashed worker thread is silent."""
-    try:
-        if not issubclass(args.exc_type, (KeyboardInterrupt, SystemExit)):
-            # Same rule as _excepthook: a log-then-raise keeps the logger's group.
-            name = getattr(args.exc_value, _REPORTED_ATTR, None) or "adam.uncaught"
-            logging.getLogger(name).critical(
-                "uncaught exception in thread %s: %s",
-                getattr(args.thread, "name", "?"),
-                args.exc_value,
-                exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
-            )
-    except Exception:  # noqa: BLE001 - the hook must never mask the crash
-        pass
+    _report_uncaught(
+        args.exc_type, args.exc_value, args.exc_traceback, getattr(args.thread, "name", "?")
+    )
     if _original_thread_excepthook is not None:
         _original_thread_excepthook(args)
 
