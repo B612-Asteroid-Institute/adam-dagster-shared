@@ -13,7 +13,7 @@ failures plus a cross-surface ER overview.
 
 | Surface | Wiring | Grouping key |
 |---|---|---|
-| Every Dagster code location | `alerting/er_log_handler.py`, attached instance-wide via the Helm chart's `pythonLogs.dagsterHandlerConfig`; module loggers listed in `pythonLogs.managedPythonLoggers` flow through it too | (exception class, step) |
+| Every Dagster code location | `alerting/er_log_handler.py`, attached instance-wide via the Helm chart's `pythonLogs.dagsterHandlerConfig`. It sees Dagster events, `context.log` and `dagster.get_dagster_logger()`; plain module loggers do not reach it (`managedPythonLoggers` is deliberately unset: it writes every record at every level to the event log) | (exception class, step) |
 | Django services (adam-api) | `er_logging.ErrorReportingHandler` on the root logger via settings LOGGING | (exception class, `METHOD /route/{id}`) |
 | Workers (adam-jobs) | `er_logging.ErrorReportingHandler` in `logging.basicConfig(handlers=[...])` | (exception class, logger name) |
 
