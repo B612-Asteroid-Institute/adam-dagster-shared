@@ -91,11 +91,14 @@ def test_handler_chains_excepthook_and_reports_uncaught_as_critical(monkeypatch,
     out = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
     assert len(out) == 1
     assert out[0]["severity"] == "CRITICAL"
-    assert out[0]["message"].startswith("RuntimeError in adam.uncaught:")
+    # keyed on the raising function, by source name
+    assert out[0]["message"].startswith(
+        f"RuntimeError in {__name__}.test_handler_chains_excepthook_and_reports_uncaught_as_critical:"
+    )
     assert out[0]["message"].splitlines()[-1] == "-- severity: critical"  # renderer styles from this
     assert out[0]["serviceContext"]["service"] == "unit-test-ns/precovery-v2-shard"
     assert len(chained) == 1, "original excepthook must still run, once"
-    # log-then-raise: the crash joins the logger's group instead of minting "adam.uncaught"
+    # log-then-raise: the crash joins the logger's group instead of minting a second one
     try:
         root.addHandler(ErrorReportingHandler())
         try:
@@ -154,7 +157,7 @@ def test_thread_crashes_report_critical_and_long_messages_stay_bounded(monkeypat
     before = list(root.handlers)
 
     def crash():
-        raise RuntimeError("publisher thread died")
+        json.loads("{")  # raised inside the stdlib: the key must still be our function
 
     try:
         root.addHandler(ErrorReportingHandler())
@@ -167,7 +170,9 @@ def test_thread_crashes_report_critical_and_long_messages_stay_bounded(monkeypat
     out = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
     assert len(out) == 1, [o["message"].splitlines()[0] + " / " + o["logging.googleapis.com/labels"]["logger"] for o in out]
     assert out[0]["severity"] == "CRITICAL"
-    assert out[0]["message"].startswith("RuntimeError in adam.uncaught:")
+    assert out[0]["message"].startswith(
+        f"JSONDecodeError in {__name__}.test_thread_crashes_report_critical_and_long_messages_stay_bounded.crash:"
+    )
     assert "in thread publisher" in out[0]["message"]
 
     def log_then_crash():

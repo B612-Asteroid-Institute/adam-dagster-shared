@@ -18,7 +18,8 @@ failures plus a cross-surface ER overview.
 | Workers (adam-jobs) | `er_logging.ErrorReportingHandler` in `logging.basicConfig(handlers=[...])` | (exception class, logger name) |
 
 Constructing `er_logging.ErrorReportingHandler` also chains `sys.excepthook`, so an uncaught
-exception in a service or worker reports as CRITICAL.
+exception in a service or worker reports as CRITICAL, grouped by (exception class,
+`module.function` of the innermost frame in our own code).
 
 Deliberately not reported as cards (the daily digest counts them by class): spot
 preemption / node-drain interrupts (`DagsterExecutionInterruptedError`), step pods that

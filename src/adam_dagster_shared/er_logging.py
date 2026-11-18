@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import sys
+import sysconfig
 import threading
 import traceback
 
@@ -247,11 +248,32 @@ _original_excepthook = None
 _original_thread_excepthook = None
 
 
+_STDLIB = sysconfig.get_paths()["stdlib"]
+
+
+def _raise_site(tb) -> str:
+    """"module.function" of the innermost frame in our own code (not stdlib or an installed
+    package), else of the innermost frame. Built from source names only, so the same function
+    always yields the same key: no line numbers, ids or addresses."""
+    ours = last = ""
+    for frame, _ in traceback.walk_tb(tb):
+        code, scope = frame.f_code, frame.f_globals
+        # __spec__.name is the real module even when it runs as __main__ (python -m).
+        module = getattr(scope.get("__spec__"), "name", None) or scope.get("__name__", "?")
+        func = getattr(code, "co_qualname", code.co_name).replace("<locals>.", "")
+        last = f"{module}.{func}"
+        path = code.co_filename
+        if not (path.startswith(("<", _STDLIB)) or "site-packages" in path or "dist-packages" in path):
+            ours = last
+    return ours or last or "adam.uncaught"
+
+
 def _report_uncaught(exc_type, exc, tb, thread: str = "") -> None:
     try:
         if not issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
-            # A log-then-raise crash keeps the logger's group instead of minting a second one.
-            name = getattr(exc, _REPORTED_ATTR, None) or "adam.uncaught"
+            # A log-then-raise crash keeps the logger's group instead of minting a second one;
+            # otherwise the group is keyed on the function that raised.
+            name = getattr(exc, _REPORTED_ATTR, None) or _raise_site(tb)
             where = f" in thread {thread}" if thread else ""
             logging.getLogger(name).critical(
                 "uncaught exception%s: %s", where, exc, exc_info=(exc_type, exc, tb)
