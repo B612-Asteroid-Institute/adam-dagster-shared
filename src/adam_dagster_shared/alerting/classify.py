@@ -92,6 +92,8 @@ def classify(ctx: FailureContext) -> Verdict:
         text = f"{cls or ''} {msg}".lower()
         if _START_TIMEOUT_MARKER in text:
             klass = "start-timeout"
+        elif "dagsterexecutioninterruptederror" in text:  # the run worker itself was SIGTERMed
+            klass = "interrupted"
         elif any(m in text for m in _CRASH_RESUME_MARKERS):
             klass = "run-worker-crash"
         else:

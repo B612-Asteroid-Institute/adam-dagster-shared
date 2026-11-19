@@ -21,7 +21,8 @@ Constructing `er_logging.ErrorReportingHandler` also chains `sys.excepthook`, so
 exception in a service or worker reports as CRITICAL, grouped by (exception class,
 `module.function` of the innermost frame in our own code).
 
-Deliberately not reported as cards (the daily digest counts them by class): spot
+Deliberately not reported as per-error cards (the daily digest counts them by class, and
+the tick watch cards a run they kill for good): spot
 preemption / node-drain interrupts (`DagsterExecutionInterruptedError`), step pods that
 vanished (`failed health check`: evicted, preempted or OOM-killed — Dagster cannot tell
 which), run cancels, and steps abandoned because an upstream step failed.
@@ -51,7 +52,11 @@ instigator and exception class, re-alerted daily), runs that hit the run-start t
 daemon marks failed without a log handler ever seeing it (run worker lost after its resume
 attempts, max runtime exceeded, launch failure): one card per scan listing the runs. It
 finds them with one `fetch_run_status_changes` query over the last hour (RUN_FAILURE events
-that carry neither an exception nor the run worker's "Steps failed" summary). Suppression
+that carry neither an exception nor the run worker's "Steps failed" summary). The same scan
+posts one "lost to infrastructure" card per scan for runs that ended failed because a step
+was preempted, evicted or OOM-killed and nothing retried it (a recovered step retry never
+fails the run; backfill runs are skipped; at most 50 new in-run failures are examined per
+scan). Suppression
 is recorded only once Slack accepted the post — the watchdog does the same — and a
 rejected post keeps the scan window open, so an outage delays a card instead of eating it.
 

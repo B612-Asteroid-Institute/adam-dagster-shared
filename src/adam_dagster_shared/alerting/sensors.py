@@ -24,7 +24,7 @@ from dagster._core.scheduler.instigation import TickStatus
 from adam_dagster_shared.er_logging import current_namespace, env_flag
 
 from .classify import FailureContext, classify
-from .extract import run_failure_of
+from .extract import extract_failure_context, run_failure_of
 from .slack import actions_block, env_prefix, link_button, post_message, section
 
 _FLOOR_SECONDS = 2 * 3600
@@ -173,6 +173,8 @@ _TICK_OVERLAP = 300  # ticks that began before the last scan but failed after it
 _START_TIMEOUT_STORM = 3  # failed-to-start runs per hour before a post
 _FAILURE_SCAN_LIMIT = 500  # RUN_FAILURE events examined per tick (one event-log query)
 _LOST_RUNS_LISTED = 3  # run ids quoted in a card
+_POD_LOSS = {"interrupted", "k8s-job-death", "system-oom"}  # the log handler skips these by design
+_POD_LOSS_SCAN = 50  # in-run failures examined per tick (two queries each)
 
 
 def _instigator_url(state, dagster_url: str) -> str:
@@ -220,12 +222,16 @@ def failing_instigators(instance, since: float) -> list[tuple]:
     return out
 
 
-def unbridged_run_failures(instance, since: float) -> tuple[list[dict], bool]:
-    """RUN_FAILURE events the daemon stored directly, newest first: run-start timeouts, run
-    workers lost after every resume attempt, max-runtime kills, launch failures. The daemon
-    logs them at INFO and they never pass a log handler, so this is their only path to a card.
-    Excluded: the run worker's "Steps failed: [...]" summary and failures that carry an
-    exception, which the Dagster-side handler already reported. Returns (failures, complete)."""
+def unbridged_run_failures(instance, since: float, fresh_since: float = 0.0) -> tuple[list[dict], bool]:
+    """RUN_FAILURE events no log handler reported, newest first. Returns (failures, complete).
+
+    Daemon-side: run-start timeouts, run workers lost after every resume attempt, max-runtime
+    kills, launch failures. The daemon logs them at INFO and they never pass a log handler.
+
+    In-run (only those newer than `fresh_since`): runs that ended failed because a step was
+    preempted, evicted or OOM-killed. Step retries that recovered never get here, so these are
+    the ones nothing retried. Backfill runs are skipped (human-watched; a preemption storm
+    during one is expected). Every other in-run failure was already reported by the handler."""
     result = instance.fetch_run_status_changes(
         RunStatusChangeRecordsFilter(
             event_type=DagsterEventType.RUN_FAILURE, after_timestamp=float(since)
@@ -233,26 +239,32 @@ def unbridged_run_failures(instance, since: float) -> tuple[list[dict], bool]:
         limit=_FAILURE_SCAN_LIMIT,
     )
     out: list[dict] = []
+    budget = _POD_LOSS_SCAN
     for record in result.records:
         try:
             entry = record.event_log_entry
             evt = entry.dagster_event
             data = evt.event_specific_data
-            if getattr(data, "error", None) is not None:
-                continue
-            if getattr(getattr(data, "failure_reason", None), "value", None) == "STEP_FAILURE":
-                continue
-            run_failure = run_failure_of(evt) or (None, "")
             job = entry.job_name or evt.job_name or ""
-            ctx = FailureContext(run_id=entry.run_id, job_name=job, tags={}, run_failure=run_failure)
+            reason = getattr(getattr(data, "failure_reason", None), "value", None)
+            if getattr(data, "error", None) is not None or reason == "STEP_FAILURE":
+                if entry.timestamp <= fresh_since or budget <= 0:
+                    continue
+                budget -= 1
+                run = instance.get_run_by_id(entry.run_id)
+                tags = (run.tags if run else None) or {}
+                if run is None or "dagster/backfill" in tags or tags.get("dagster/will_retry") == "true":
+                    continue
+                verdict = classify(extract_failure_context(instance, run))
+                if verdict.klass not in _POD_LOSS:
+                    continue
+                klass, message = verdict.klass, verdict.exception or ""
+            else:
+                run_failure = run_failure_of(evt) or (None, "")
+                ctx = FailureContext(run_id=entry.run_id, job_name=job, tags={}, run_failure=run_failure)
+                klass, message = classify(ctx).klass, (run_failure[1].splitlines() or [""])[0]
             out.append(
-                {
-                    "run_id": entry.run_id,
-                    "job": job,
-                    "klass": classify(ctx).klass,
-                    "message": (run_failure[1].splitlines() or [""])[0],
-                    "ts": entry.timestamp,
-                }
+                {"run_id": entry.run_id, "job": job, "klass": klass, "message": message, "ts": entry.timestamp}
             )
         except Exception:
             continue
@@ -311,10 +323,10 @@ def alerting_tick_failure_watch(context: dg.SensorEvaluationContext):
             ("Open in Dagster", _instigator_url(instigator, dagster_url)),
         )
 
-    failures, complete = unbridged_run_failures(context.instance, now - 3600)
+    failures, complete = unbridged_run_failures(context.instance, now - 3600, since)
     if not complete:
         context.log.warning(
-            f"alerting tick watch: over {_FAILURE_SCAN_LIMIT} daemon-side run failures in the "
+            f"alerting tick watch: over {_FAILURE_SCAN_LIMIT} run failures in the "
             "last hour; only the newest were scanned"
         )
 
@@ -327,28 +339,35 @@ def alerting_tick_failure_watch(context: dg.SensorEvaluationContext):
         )
         deliver(["start-timeout"], "runs failing to start", text, ("Open runs in Dagster", f"{dagster_url}/runs"))
 
-    lost = [
+    fresh = [
         f
         for f in failures
         if f["klass"] != "start-timeout"
         and f["ts"] > since
         and now - alerted.get(f"run|{f['run_id']}", 0.0) > _REALERT
     ]
-    if lost:
+    for title, cause, lost in (
+        (
+            "failed outside the run worker",
+            "worker lost after its resume attempts, max runtime exceeded, or launch failed; no step reported it",
+            [f for f in fresh if f["klass"] not in _POD_LOSS],
+        ),
+        (
+            "lost to infrastructure",
+            "a step was preempted, evicted or OOM-killed and nothing retried it",
+            [f for f in fresh if f["klass"] in _POD_LOSS],
+        ),
+    ):
+        if not lost:
+            continue
         top = ", ".join(f"`{job}` ×{n}" for job, n in Counter(f["job"] for f in lost).most_common(3))
         ids = ", ".join(f"`{f['run_id'][:8]}`" for f in lost[:_LOST_RUNS_LISTED])
         plural = "s" if len(lost) != 1 else ""
         text = (
-            f"🟠 *{env_prefix(namespace)}Run{plural} failed outside the run worker* — {len(lost)} run{plural} "
-            "since the last scan (worker lost after its resume attempts, max runtime exceeded, or launch "
-            f"failed; no step reported it): {top} · {ids}\n> {lost[0]['message'][:300]}"
+            f"🟠 *{env_prefix(namespace)}Run{plural} {title}* — {len(lost)} run{plural} since the last scan "
+            f"({cause}): {top} · {ids}\n> {lost[0]['message'][:300]}"
         )
-        deliver(
-            [f"run|{f['run_id']}" for f in lost],
-            "runs failed outside the run worker",
-            text,
-            ("Open runs in Dagster", f"{dagster_url}/runs"),
-        )
+        deliver([f"run|{f['run_id']}" for f in lost], f"runs {title}", text, ("Open runs in Dagster", f"{dagster_url}/runs"))
 
     state["alerted"] = {k: v for k, v in alerted.items() if now - v <= 2 * _REALERT}
     state["since"] = last_scan if rejected else now  # a rejected post keeps the window open

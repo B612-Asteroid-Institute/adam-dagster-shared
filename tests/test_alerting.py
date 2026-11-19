@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import dagster as dg
 import pytest
 from dagster._core.definitions.run_request import InstigatorType
-from dagster._core.events import JobFailureData, RunFailureReason
+from dagster._core.events import DagsterEvent, JobFailureData, RunFailureReason, StepFailureData
 from dagster._utils.error import SerializableErrorInfo
 
 from adam_dagster_shared.alerting import renderer, sensors
@@ -307,27 +307,37 @@ def test_tick_watch_posts_failing_instigators_and_daemon_side_run_failures(monke
         instance.report_run_failed(lost, (
             "Detected run worker status FAILED. Marking run as failed, because it has "
             "surpassed the configured maximum attempts to resume the run: 10."))
+        # A step pod that vanished (preempted, evicted, OOM-killed): no exception, so no handler
+        # card; the run failing for good is the notice. The same loss in a backfill is skipped.
+        for tags in ({}, {"dagster/backfill": "b1"}):
+            gone = instance.create_run_for_job(failing_job, tags=tags)
+            instance.report_dagster_event(DagsterEvent(
+                "STEP_FAILURE", "failing_job", step_key="boom", message="Step boom failed health check: pod gone",
+                event_specific_data=StepFailureData(error=None, user_failure_data=None)), gone.run_id)
+            instance.report_run_failed(gone, "Steps failed: ['boom'].", JobFailureData(
+                error=None, failure_reason=RunFailureReason.STEP_FAILURE))
         failures, complete = sensors.unbridged_run_failures(instance, since=0)
         assert complete
-        assert sorted(f["klass"] for f in failures) == ["run-worker-crash"] + ["start-timeout"] * 3
+        assert sorted(f["klass"] for f in failures) == ["k8s-job-death", "run-worker-crash"] + ["start-timeout"] * 3
 
         accept[0] = False  # Slack down: nothing is suppressed and the scan window stays open
         with dg.build_sensor_context(instance=instance) as ctx:
             sensors.alerting_tick_failure_watch(ctx)
             cursor = ctx.cursor
-        assert len(posted) == 3 and json.loads(cursor)["alerted"] == {}
+        assert len(posted) == 4 and json.loads(cursor)["alerted"] == {}
         accept[0] = True
         with dg.build_sensor_context(instance=instance, cursor=cursor) as ctx:
             sensors.alerting_tick_failure_watch(ctx)
             cursor = ctx.cursor
-        assert posted[3:] == [
+        assert posted[4:] == [
             "schedule failing: mpc_designation_lookup_schedule",
             "runs failing to start",
             "runs failed outside the run worker",
+            "runs lost to infrastructure",
         ]
         with dg.build_sensor_context(instance=instance, cursor=cursor) as ctx:  # 24h re-alert window
             sensors.alerting_tick_failure_watch(ctx)
-    assert len(posted) == 6
+    assert len(posted) == 8
 
 
 # ===== Dagster log handler =====
