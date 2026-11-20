@@ -202,7 +202,8 @@ def innermost_error(error) -> tuple[str, str]:
 
 
 def failing_instigators(instance, since: float) -> list[tuple]:
-    """(state, failed ticks newest-first) for every running sensor/schedule that failed since."""
+    """(state, failed ticks newest-first) for every running sensor/schedule that failed since
+    and has not recovered."""
     out = []
     for state in instance.all_instigator_state():
         try:
@@ -215,6 +216,11 @@ def failing_instigators(instance, since: float) -> list[tuple]:
                 limit=25,
                 statuses=[TickStatus.FAILURE],
             )
+            # One failed tick while a code server restarts in a deploy is not news: skip an
+            # instigator whose most recent tick has already recovered.
+            latest = ticks and instance.get_ticks(state.instigator_origin_id, state.selector_id, limit=1)
+            if latest and getattr(latest[0], "status", None) in (TickStatus.SUCCESS, TickStatus.SKIPPED):
+                continue
         except Exception:
             continue
         if ticks:

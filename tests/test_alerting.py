@@ -14,6 +14,7 @@ import dagster as dg
 import pytest
 from dagster._core.definitions.run_request import InstigatorType
 from dagster._core.events import DagsterEvent, JobFailureData, RunFailureReason, StepFailureData
+from dagster._core.scheduler.instigation import TickStatus
 from dagster._utils.error import SerializableErrorInfo
 
 from adam_dagster_shared.alerting import renderer, sensors
@@ -293,9 +294,14 @@ def test_tick_watch_posts_failing_instigators_and_daemon_side_run_failures(monke
         boom()
 
     with dg.DagsterInstance.ephemeral() as instance:
-        monkeypatch.setattr(instance, "all_instigator_state", lambda **kw: [schedule, SimpleNamespace(
+        recovered = SimpleNamespace(  # one failed tick during a deploy restart, fine since: no card
+            is_running=True, selector_id="rec", instigator_origin_id="rec", origin=None,
+            instigator_name="recovered_sensor", instigator_type=InstigatorType.SENSOR,
+        )
+        monkeypatch.setattr(instance, "all_instigator_state", lambda **kw: [schedule, recovered, SimpleNamespace(
             is_running=False, selector_id="x", instigator_origin_id="y")])
-        monkeypatch.setattr(instance, "get_ticks", lambda *a, **kw: [tick])
+        monkeypatch.setattr(instance, "get_ticks", lambda origin, *a, **kw: (
+            [SimpleNamespace(status=TickStatus.SKIPPED)] if origin == "rec" and kw.get("limit") == 1 else [tick]))
         failing_job.execute_in_process(instance=instance, raise_on_error=False)  # "Steps failed" summary: excluded
         for i in range(3):  # the daemon marks runs failed without any log handler seeing it
             run = instance.create_run_for_job(failing_job)

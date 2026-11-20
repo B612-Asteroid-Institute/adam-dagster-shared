@@ -46,8 +46,9 @@ the ER group renderer, the daily digest job+schedule, the hung-run watchdog and 
 watch. A second registrant would double-post.
 
 The tick watch (`alerting_tick_failure_watch`, 10 min) covers what happens in the daemon
-rather than in a run pod: a sensor or schedule whose evaluation raises (one card per
-instigator and exception class, re-alerted daily), runs that hit the run-start timeout
+rather than in a run pod: a sensor or schedule whose evaluation raises and whose latest tick
+has not recovered (one card per instigator and exception class, re-alerted daily; a single
+failed tick during a code-server restart is skipped), runs that hit the run-start timeout
 (≥3 in an hour → one card per day; `start-timeout` in the digest), and every other run the
 daemon marks failed without a log handler ever seeing it (run worker lost after its resume
 attempts, max runtime exceeded, launch failure): one card per scan listing the runs. It
