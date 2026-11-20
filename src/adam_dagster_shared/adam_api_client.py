@@ -7,7 +7,6 @@ from typing import Any, Dict, Optional
 
 import requests
 from kubernetes import client as k8s_client
-from kubernetes.client.rest import ApiException
 from pydantic import BaseModel, Field, field_validator
 
 from adam_dagster_shared.k8s import get_current_namespace, get_node_sa_kubernetes_client

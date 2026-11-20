@@ -12,7 +12,6 @@ import base64
 import hashlib
 import subprocess
 from pathlib import Path
-from typing import Any
 from unittest import mock
 
 import pytest
